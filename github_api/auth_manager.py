@@ -49,16 +49,19 @@ class GitHubAuthManager:
         private_key = self._load_private_key()
         return jwt.encode(payload, private_key, algorithm="RS256")
     
-    def get_installation_token(self, installation_id: str) -> str:
+    def get_installation_token(self, installation_id) -> str:
         """
         Get installation access token (cached for 1 hour)
         
         Args:
-            installation_id: GitHub App installation ID
+            installation_id: GitHub App installation ID (str or int)
             
         Returns:
             Installation access token
         """
+        # Convert to string to ensure consistent key type
+        installation_id = str(installation_id)
+        
         # Check cache
         if installation_id in self._installation_tokens:
             token, expiry = self._installation_tokens[installation_id]

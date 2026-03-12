@@ -35,6 +35,50 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def ensure_kb_service():
+    """Ensure KB Service is running, start if not"""
+    import requests
+    import subprocess
+    import time
+    
+    kb_url = os.environ.get("KB_SERVICE_URL", "http://localhost:8000")
+    
+    try:
+        resp = requests.get(f"{kb_url}/health", timeout=2)
+        if resp.status_code == 200:
+            return True  # Already running
+    except:
+        pass
+    
+    # Try to start KB Service
+    logger.info("KB Service not running, attempting to start...")
+    try:
+        # Start in background
+        subprocess.Popen(
+            [sys.executable, "-m", "knowledge_base.kb_service"],
+            stdout=open("/tmp/kb_service.log", "a"),
+            stderr=subprocess.STDOUT,
+            start_new_session=True
+        )
+        
+        # Wait for it to start
+        for i in range(10):
+            time.sleep(1)
+            try:
+                resp = requests.get(f"{kb_url}/health", timeout=2)
+                if resp.status_code == 200:
+                    logger.info("✅ KB Service auto-started successfully")
+                    return True
+            except:
+                pass
+        
+        logger.warning("⚠️  KB Service auto-start timed out")
+        return False
+    except Exception as e:
+        logger.warning(f"⚠️  Failed to auto-start KB Service: {e}")
+        return False
+
+
 def create_processor() -> IssueProcessor:
     """Create and configure the issue processor with all components"""
     
@@ -60,6 +104,10 @@ def create_processor() -> IssueProcessor:
     
     # Knowledge Base components (Phase 3)
     logger.info("Initializing Knowledge Base...")
+    
+    # Ensure KB Service is running
+    ensure_kb_service()
+    
     kb_client = KBClient()
     kb_integrator = KBIntegrator(kb_client)
     

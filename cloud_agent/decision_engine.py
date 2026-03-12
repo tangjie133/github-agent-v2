@@ -60,7 +60,8 @@ class DecisionEngine:
         """
         intent = intent_result.intent
         
-        logger.info(f"Making decision for intent: {intent.value}")
+        logger.info(f"🎯 [Decision Engine] Making decision for intent: {intent.value}")
+        logger.info(f"   OpenClaw client available: {self.client is not None}")
         
         if intent == IntentType.ANSWER:
             return self._handle_answer(context_text, intent_result)
@@ -119,15 +120,17 @@ class DecisionEngine:
         intent_result: IntentResult
     ) -> ActionPlan:
         """Handle modify intent - plan code changes"""
-        logger.info("Decision: plan code modification")
+        logger.info("📝 [Decision Engine] Decision: plan code modification")
         
         # Use OpenClaw for detailed planning if available
         if self.client:
             try:
+                logger.info("🔄 [Decision Engine] Trying OpenClaw for detailed planning...")
                 decision = self.client.make_decision(
                     context_text,
                     intent_result.intent.value
                 )
+                logger.info("✅ [Decision Engine] OpenClaw planning successful")
                 
                 return ActionPlan(
                     action="modify",
@@ -138,7 +141,10 @@ class DecisionEngine:
                     needs_confirmation=False
                 )
             except Exception as e:
-                logger.error(f"Decision making failed: {e}")
+                logger.warning(f"⚠️  [Decision Engine] OpenClaw planning failed: {e}")
+                logger.info("🔄 [Decision Engine] Using LOCAL FALLBACK for modification plan")
+        else:
+            logger.info("🔄 [Decision Engine] OpenClaw not available, using LOCAL FALLBACK")
         
         # Fallback: simple modification plan
         return ActionPlan(

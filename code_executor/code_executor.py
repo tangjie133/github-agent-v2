@@ -147,11 +147,14 @@ class CodeExecutor:
             
             # Step 5: 创建 PR
             if github_token:
-                from core.github_client import GitHubClient
-                github = GitHubClient(github_token)
-                
-                pr_title = f"[Agent] {instruction[:80]}"
-                pr_body = f"""🤖 此 PR 由 GitHub Agent 自动创建
+                logger.info(f"Creating PR with token (length: {len(github_token)})")
+                try:
+                    from github_api.github_client import GitHubClient
+                    # Create client with token directly (for code executor)
+                    github = GitHubClient(token=github_token)
+                    
+                    pr_title = f"[Agent] {instruction[:80]}"
+                    pr_body = f"""🤖 此 PR 由 GitHub Agent 自动创建
 
 ## 修改说明
 
@@ -164,29 +167,40 @@ class CodeExecutor:
 ---
 fixes #{issue_number}
 """
-                pr = github.create_pull_request(
-                    owner, repo,
-                    title=pr_title,
-                    head=branch_name,
-                    base="main",
-                    body=pr_body
-                )
-                
-                if pr:
-                    return {
-                        "status": "completed",
-                        "pr_number": pr["number"],
-                        "pr_url": pr["html_url"],
-                        "files_modified": files_modified,
-                        "branch": branch_name
-                    }
+                    logger.info(f"Creating PR: {pr_title}")
+                    logger.info(f"  Owner: {owner}, Repo: {repo}")
+                    logger.info(f"  Head: {branch_name}, Base: main")
+                    
+                    pr = github.create_pull_request(
+                        owner, repo,
+                        title=pr_title,
+                        head=branch_name,
+                        base="main",
+                        body=pr_body
+                    )
+                    
+                    if pr:
+                        logger.info(f"✅ PR created successfully: #{pr['number']} - {pr['html_url']}")
+                        return {
+                            "status": "completed",
+                            "pr_number": pr["number"],
+                            "pr_url": pr["html_url"],
+                            "files_modified": files_modified,
+                            "branch": branch_name
+                        }
+                    else:
+                        logger.error("❌ PR creation returned None")
+                except Exception as e:
+                    logger.exception(f"❌ Failed to create PR: {e}")
+            else:
+                logger.warning("⚠️  No GitHub token provided, cannot create PR")
             
-            # 没有 GitHub token，只能返回分支信息
+            # 没有 GitHub token 或 PR 创建失败，只能返回分支信息
             return {
                 "status": "completed",
                 "branch": branch_name,
                 "files_modified": files_modified,
-                "message": "分支已推送，请手动创建 PR"
+                "message": "分支已推送，但 PR 创建失败，请手动创建 PR"
             }
         
         except Exception as e:
@@ -309,9 +323,18 @@ fixes #{issue_number}
         
         # 修改现有文件
         try:
+            logger.debug(f"原始内容: {len(original_content)} 字符")
             new_content = self.modifier.modify_file(
                 file_path, original_content, instruction
             )
+            
+            logger.debug(f"修改后内容: {len(new_content)} 字符")
+            
+            # 检查是否真的修改了
+            if new_content == original_content:
+                logger.warning(f"⚠️  文件内容未变化: {file_path}")
+                logger.warning(f"   AI 修改器没有产生实际变更")
+                return False
             
             # 验证修改
             val_result = self.validator.validate_file(file_path, new_content)
@@ -321,7 +344,14 @@ fixes #{issue_number}
             
             # 写入修改
             self.repo_mgr.write_file(repo_path, file_path, new_content)
-            logger.info(f"✅ 文件修改成功: {file_path}")
+            
+            # 验证写入成功
+            saved_content = self.repo_mgr.get_file_content(repo_path, file_path)
+            if saved_content != new_content:
+                logger.error(f"❌ 文件写入验证失败: {file_path}")
+                return False
+            
+            logger.info(f"✅ 文件修改成功: {file_path} ({len(original_content)} → {len(new_content)} 字符)")
             return True
         
         except Exception as e:

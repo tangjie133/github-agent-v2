@@ -118,10 +118,22 @@ REPLACE:
 替换后的新代码
 ```
 
-要求：
-1. SEARCH 块必须能在原代码中精确匹配
-2. 包含足够的上下文确保匹配唯一性
-3. 只修改需要修改的地方"""
+⚠️ **重要要求**：
+1. **必须产生实际修改** - SEARCH 和 REPLACE 必须不同
+2. **明确修改内容** - 在 REPLACE 中添加注释说明修改了什么
+3. **SEARCH 块必须能在原代码中精确匹配**
+4. **包含足够的上下文** 确保匹配唯一性（3-5行）
+5. **只修改需要修改的地方**
+
+示例：
+SEARCH:
+```
+  writeReg(0x01, 0xEF);  // User's temp fix
+```
+REPLACE:
+```
+  writeReg(0x01, 0x21);  // Fixed: correct value for 1Hz output
+```"""
         
         # 调用 AI 生成 SEARCH/REPLACE
         logger.info(f"请求 AI 生成精确替换: {file_path}")
@@ -141,11 +153,18 @@ REPLACE:
         # 执行替换
         if search_text in file_content:
             new_content = file_content.replace(search_text, replace_text, 1)
-            logger.info(f"✅ 精确替换成功: {file_path}")
+            # 验证是否真的修改了
+            if new_content == file_content:
+                logger.warning(f"⚠️  替换后内容未变化，SEARCH 和 REPLACE 可能相同: {file_path}")
+                raise ValueError("SEARCH 和 REPLACE 内容相同，没有实际修改")
+            logger.info(f"✅ 精确替换成功: {file_path} ({len(search_text)} → {len(replace_text)} 字符)")
             return new_content
         else:
             logger.error(f"❌ SEARCH 文本未找到: {file_path}")
-            logger.debug(f"SEARCH 文本: {search_text[:100]}...")
+            logger.debug(f"SEARCH 文本 ({len(search_text)} 字符):")
+            logger.debug(search_text[:200])
+            logger.debug(f"文件内容 ({len(file_content)} 字符):")
+            logger.debug(file_content[:200])
             raise ValueError(f"无法在文件中找到要替换的文本: {search_text[:50]}...")
     
     def _chunked_modify(
@@ -166,6 +185,7 @@ REPLACE:
         total_lines = len(lines)
         
         logger.info(f"大文件 ({total_lines} 行)，使用分段处理: {file_path}")
+        logger.debug(f"原始内容 MD5: {hash(file_content) % 10000}")  # 简单指纹
         
         # 第一步：让 AI 找出需要修改的行号
         line_prompt = f"""分析大文件，找出需要修改的行号。
@@ -207,29 +227,56 @@ REPLACE:
                 
                 # 应用修改
                 new_content = file_content
-                for mod in modifications:
+                total_changes = 0
+                for i, mod in enumerate(modifications):
                     start = mod.get("start_line", 1) - 1
                     end = mod.get("end_line", total_lines)
                     desc = mod.get("description", "")
+                    
+                    logger.info(f"  修改 {i+1}/{len(modifications)}: 行 {start+1}-{end} - {desc}")
                     
                     # 提取上下文（前后各3行）
                     context_start = max(0, start - 3)
                     context_end = min(total_lines, end + 3)
                     chunk = '\n'.join(lines[context_start:context_end])
                     
+                    logger.debug(f"  原始 chunk ({len(chunk)} 字符):")
+                    logger.debug(f"  {chunk[:200]}...")
+                    
                     # 修改这个 chunk
-                    modified_chunk = self._ai_assisted_replace(
-                        file_path,
-                        chunk,
-                        f"{instruction}\n具体: {desc}"
-                    )
+                    try:
+                        modified_chunk = self._ai_assisted_replace(
+                            file_path,
+                            chunk,
+                            f"{instruction}\n具体: {desc}"
+                        )
+                    except Exception as e:
+                        logger.error(f"  chunk 修改失败: {e}")
+                        continue
+                    
+                    logger.debug(f"  修改后 chunk ({len(modified_chunk)} 字符):")
+                    logger.debug(f"  {modified_chunk[:200]}...")
+                    
+                    # 检查是否真的修改了
+                    if chunk == modified_chunk:
+                        logger.warning(f"  ⚠️  chunk {i+1} 没有变化，AI 可能没有实际修改代码")
+                        continue
                     
                     # 替换回原内容
                     new_content = new_content.replace(chunk, modified_chunk, 1)
+                    total_changes += 1
+                    logger.info(f"  ✅ chunk {i+1} 修改完成")
+                
+                if total_changes == 0:
+                    logger.warning(f"⚠️  所有 chunk 都没有实际修改，返回原始内容")
+                else:
+                    logger.info(f"✅ 共完成 {total_changes} 处修改")
                 
                 return new_content
         except Exception as e:
             logger.error(f"分段修改失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
         
         # 失败时返回原始内容（安全回退）
         logger.warning(f"⚠️  分段修改失败，返回原始内容: {file_path}")

@@ -73,35 +73,84 @@ class GitHubRepoWatcher:
             headers["Authorization"] = f"token {self.token}"
         return headers
     
+    def _get_proxies(self) -> Dict[str, str]:
+        """获取代理配置"""
+        proxies = {}
+        
+        # 从环境变量读取代理配置
+        http_proxy = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
+        https_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+        all_proxy = os.environ.get("ALL_PROXY") or os.environ.get("all_proxy")
+        
+        if http_proxy:
+            proxies["http"] = http_proxy
+        if https_proxy:
+            proxies["https"] = https_proxy
+        if all_proxy and not proxies:
+            proxies["http"] = all_proxy
+            proxies["https"] = all_proxy
+            
+        return proxies
+    
     def get_repo_files(self) -> List[Dict]:
         """获取仓库文件列表"""
         import requests
         
         url = f"{self.api_base}/repos/{self.repo}/git/trees/{self.branch}?recursive=1"
         
-        try:
-            response = requests.get(url, headers=self._get_headers(), timeout=30)
-            response.raise_for_status()
-            data = response.json()
-            
-            files = []
-            for item in data.get("tree", []):
-                if item.get("type") == "blob":
-                    ext = Path(item["path"]).suffix.lower()
-                    if ext in SUPPORTED_EXTS:
-                        files.append({
-                            "path": item["path"],
-                            "sha": item["sha"],
-                            "size": item.get("size", 0),
-                            "url": item["url"]
-                        })
-            
-            logger.info(f"📁 发现 {len(files)} 个支持的文件")
-            return files
-            
-        except Exception as e:
-            logger.error(f"❌ 获取文件列表失败: {e}")
-            return []
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = requests.get(url, headers=self._get_headers(), proxies=self._get_proxies(), timeout=30)
+                
+                # 处理速率限制
+                if response.status_code == 403 and "rate limit" in response.text.lower():
+                    if not self.token:
+                        logger.error("❌ GitHub API 速率限制 exceeded")
+                        logger.error("   原因: 未提供 GITHUB_TOKEN")
+                        logger.error("   解决: 设置 GITHUB_TOKEN 环境变量")
+                        logger.error("   获取: https://github.com/settings/tokens")
+                        return []
+                    else:
+                        # 有 token 但仍然被限制，等待重试
+                        reset_time = int(response.headers.get("X-RateLimit-Reset", 0))
+                        if reset_time:
+                            wait_sec = max(reset_time - int(time.time()), 60)
+                            logger.warning(f"⚠️  API 速率限制，等待 {wait_sec} 秒后重试...")
+                            time.sleep(min(wait_sec, 60))  # 最多等待60秒
+                            continue
+                
+                response.raise_for_status()
+                data = response.json()
+                
+                files = []
+                for item in data.get("tree", []):
+                    if item.get("type") == "blob":
+                        ext = Path(item["path"]).suffix.lower()
+                        if ext in SUPPORTED_EXTS:
+                            files.append({
+                                "path": item["path"],
+                                "sha": item["sha"],
+                                "size": item.get("size", 0),
+                                "url": item["url"]
+                            })
+                
+                logger.info(f"📁 发现 {len(files)} 个支持的文件")
+                return files
+                
+            except requests.exceptions.RequestException as e:
+                if attempt < max_retries - 1:
+                    wait = 2 ** attempt  # 指数退避
+                    logger.warning(f"⚠️  请求失败，{wait}秒后重试... ({e})")
+                    time.sleep(wait)
+                else:
+                    logger.error(f"❌ 获取文件列表失败: {e}")
+                    return []
+            except Exception as e:
+                logger.error(f"❌ 获取文件列表失败: {e}")
+                return []
+        
+        return []
     
     def download_file(self, file_path: str, output_path: Path) -> bool:
         """下载单个文件"""
@@ -110,7 +159,7 @@ class GitHubRepoWatcher:
         url = f"{self.raw_base}/{self.repo}/{self.branch}/{file_path}"
         
         try:
-            response = requests.get(url, headers=self._get_headers(), timeout=60)
+            response = requests.get(url, headers=self._get_headers(), proxies=self._get_proxies(), timeout=60)
             response.raise_for_status()
             
             output_path.parent.mkdir(parents=True, exist_ok=True)

@@ -227,13 +227,14 @@ class RepositoryManager:
             )
         
         # 添加所有修改
-        subprocess.run(
+        add_result = subprocess.run(
             ["git", "add", "-A"],
             cwd=repo_path,
             check=True,
             capture_output=True,
             text=True
         )
+        logger.debug(f"git add 结果: {add_result.returncode}")
         
         # 检查是否有变更
         status_result = subprocess.run(
@@ -244,8 +245,19 @@ class RepositoryManager:
             text=True
         )
         
+        logger.debug(f"git status 输出: {status_result.stdout!r}")
+        
         if not status_result.stdout.strip():
             logger.info("没有变更需要提交")
+            # 检查 diff 看看为什么
+            diff_result = subprocess.run(
+                ["git", "diff", "--cached"],
+                cwd=repo_path,
+                check=False,
+                capture_output=True,
+                text=True
+            )
+            logger.debug(f"git diff --cached: {diff_result.stdout[:500]!r}")
             return False
         
         # 提交
@@ -256,11 +268,30 @@ class RepositoryManager:
             capture_output=True,
             text=True
         )
+        logger.info(f"✅ 已提交: {message[:50]}...")
+        
+        # 推送前：先删除远程分支（如果存在），避免冲突
+        logger.info(f"检查并清理远程分支 origin/{branch}...")
+        try:
+            # 尝试删除远程分支（忽略错误，可能分支不存在）
+            delete_result = subprocess.run(
+                ["git", "push", "origin", "--delete", branch],
+                cwd=repo_path,
+                check=False,
+                capture_output=True,
+                text=True
+            )
+            if delete_result.returncode == 0:
+                logger.info(f"   已删除远程分支 origin/{branch}")
+            else:
+                logger.debug(f"   远程分支不存在或无需删除: {delete_result.stderr.strip()}")
+        except Exception as e:
+            logger.debug(f"   删除远程分支时出错: {e}")
         
         # 推送
         logger.info(f"推送到 origin/{branch}")
         try:
-            subprocess.run(
+            result = subprocess.run(
                 ["git", "push", "-u", "origin", branch],
                 cwd=repo_path,
                 check=True,
@@ -269,28 +300,38 @@ class RepositoryManager:
             )
             logger.info(f"✅ 推送成功: {branch}")
         except subprocess.CalledProcessError as e:
-            # 推送失败，可能是远程分支有新提交
-            logger.warning(f"推送失败: {e}")
-            logger.info("尝试删除远程分支后重推...")
+            # 推送失败，记录详细错误
+            stderr = e.stderr if e.stderr else "Unknown error"
+            stdout = e.stdout if e.stdout else ""
+            logger.error(f"❌ 推送失败 (exit code {e.returncode})")
+            logger.error(f"   stderr: {stderr}")
+            logger.error(f"   stdout: {stdout}")
             
-            # 删除远程分支
-            subprocess.run(
-                ["git", "push", "origin", "--delete", branch],
-                cwd=repo_path,
-                check=False,  # 分支可能不存在
-                capture_output=True,
-                text=True
-            )
-            
-            # 重新推送
-            subprocess.run(
-                ["git", "push", "-u", "origin", branch],
-                cwd=repo_path,
-                check=True,
-                capture_output=True,
-                text=True
-            )
-            logger.info(f"✅ 重推成功: {branch}")
+            # 检查常见的错误原因
+            if "Permission denied" in stderr or "403" in stderr:
+                logger.error("   原因: GitHub Token 权限不足，请检查 GITHUB_TOKEN 或 GITHUB_PRIVATE_KEY")
+                raise RuntimeError(f"GitHub 权限不足，无法推送分支 {branch}。请检查 GitHub App 权限或 Token。")
+            elif "rejected" in stderr.lower() or "non-fast-forward" in stderr.lower():
+                logger.warning("   原因: 远程分支有冲突，尝试强制推送...")
+                
+                # 尝试强制推送
+                try:
+                    subprocess.run(
+                        ["git", "push", "-f", "-u", "origin", branch],
+                        cwd=repo_path,
+                        check=True,
+                        capture_output=True,
+                        text=True
+                    )
+                    logger.info(f"✅ 强制推送成功: {branch}")
+                    return True
+                except subprocess.CalledProcessError as force_e:
+                    logger.error(f"   强制推送也失败: {force_e.stderr}")
+                    raise RuntimeError(f"无法推送分支 {branch}，请检查网络连接或 GitHub 权限")
+            else:
+                # 其他错误
+                logger.error(f"   推送失败，未知原因")
+                raise RuntimeError(f"推送分支 {branch} 失败: {stderr}")
         
         return True
     

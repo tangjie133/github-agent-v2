@@ -160,8 +160,28 @@ class IssueState:
     branch_name: str = ""
     processing_count: int = 0
     last_action: str = ""
+    follow_up_count: int = 0
+    processed_comment_ids: List[int] = field(default_factory=list)  # 已处理的评论ID
+    issue_state: str = ""  # Issue 状态 (open/closed)
+    
+    @property
+    def last_action_time(self) -> datetime:
+        """Get last action time (same as processed_at for now)"""
+        return self.processed_at
     
     def record_processing(self, action: str):
         """Record a processing action"""
         self.processing_count += 1
         self.last_action = action
+    
+    def is_comment_processed(self, comment_id: int) -> bool:
+        """Check if a comment has been processed"""
+        return comment_id in self.processed_comment_ids
+    
+    def record_comment(self, comment_id: int):
+        """Record a processed comment ID"""
+        if comment_id not in self.processed_comment_ids:
+            self.processed_comment_ids.append(comment_id)
+            # Keep only last 100 comment IDs to prevent memory bloat
+            if len(self.processed_comment_ids) > 100:
+                self.processed_comment_ids = self.processed_comment_ids[-100:]

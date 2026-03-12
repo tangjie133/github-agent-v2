@@ -14,6 +14,7 @@ from core.models import (
 )
 from core.context_builder import ContextBuilder
 from core.state_manager import StateManager
+from core.issue_followup import IssueFollowupManager
 
 # Import KB types for type hints
 try:
@@ -50,6 +51,7 @@ class IssueProcessor:
         
         self.context_builder = ContextBuilder(github_client)
         self.state_manager = StateManager()
+        self.followup_manager = IssueFollowupManager()
         
         # Configuration
         self.issue_trigger_mode = os.environ.get(
@@ -64,6 +66,10 @@ class IssueProcessor:
         self.auto_confirm_threshold = float(os.environ.get(
             "AGENT_AUTO_CONFIRM_THRESHOLD", "0.8"
         ))
+        # Issue tracking feature switch
+        self.issue_tracking_enabled = os.environ.get(
+            "AGENT_ISSUE_TRACKING_ENABLED", "true"
+        ).lower() in ("true", "1", "yes", "on")
     
     def _get_github_client(self, installation_id: str = None):
         """Get GitHub client for specific installation"""
@@ -113,11 +119,178 @@ class IssueProcessor:
             )
             
             # Get state (check if processed before)
-            state = self.state_manager.get_state(repo, issue_number)
+            repo_full_name = f"{owner}/{repo}"
+            state = self.state_manager.get_state(repo_full_name, issue_number)
             processing_count = state.processing_count if state else 0
             
             if state:
                 logger.info(f"Issue #{issue_number} has been processed {processing_count} times before")
+            
+            # ========== 防重复处理检查 ==========
+            # 1. 检查评论 ID 是否已处理（防止 Webhook 重复发送）
+            if event.event_type == "issue_comment":
+                comment = event.comment or {}
+                comment_id = comment.get("id")
+                
+                if comment_id and state and state.is_comment_processed(comment_id):
+                    logger.warning(f"Comment {comment_id} already processed, skipping duplicate")
+                    return ProcessingResult(
+                        status=ProcessingStatus.SKIPPED,
+                        issue_number=issue_number,
+                        message=f"Comment {comment_id} already processed"
+                    )
+                
+                # 记录评论 ID（如果后续处理成功会再次记录）
+                if comment_id and state:
+                    state.record_comment(comment_id)
+                    self.state_manager.save_state(state)
+            
+            # 2. 检查是否在短时间内重复处理（5 秒保护窗口）
+            if state and state.last_action:
+                from datetime import datetime, timedelta
+                time_since_last = datetime.now() - state.processed_at
+                if time_since_last < timedelta(seconds=5):
+                    logger.warning(f"Issue #{issue_number} processed {time_since_last.total_seconds():.1f}s ago, skipping")
+                    return ProcessingResult(
+                        status=ProcessingStatus.SKIPPED,
+                        issue_number=issue_number,
+                        message="Processing too frequent, skipped"
+                    )
+            
+            # 3. 获取当前 Issue 状态（防止重复关闭已关闭的 Issue）
+            github = self._get_github_client(installation_id)
+            current_issue_state = None
+            if github:
+                try:
+                    issue_info = github.get_issue(owner, repo, issue_number)
+                    current_issue_state = issue_info.get("state", "unknown")
+                    logger.info(f"Current issue #{issue_number} state: {current_issue_state}")
+                    
+                    # 更新状态中的 Issue 状态
+                    if state:
+                        state.issue_state = current_issue_state
+                        self.state_manager.save_state(state)
+                except Exception as e:
+                    logger.warning(f"Failed to get issue state: {e}")
+            
+            # Check if this is a follow-up reply confirming resolution
+            # This applies when:
+            # 1. It's a comment event (not initial issue creation)
+            # 2. User's reply contains resolution confirmation keywords
+            # Note: We don't require processing_count > 0 here because:
+            # - User might manually close without agent intervention
+            # - Previous state might be lost
+            if event.event_type == "issue_comment":
+                followup_result = self._check_followup_reply(context)
+                
+                if followup_result is True:
+                    # 检查 Issue 是否已经是关闭状态
+                    if current_issue_state == "closed":
+                        logger.info(f"Issue #{issue_number} is already closed, skipping")
+                        # 记录评论已处理
+                        if state and comment_id:
+                            state.record_comment(comment_id)
+                            self.state_manager.save_state(state)
+                        return ProcessingResult(
+                            status=ProcessingStatus.SKIPPED,
+                            issue_number=issue_number,
+                            message="Issue already closed"
+                        )
+                    
+                    # Check if issue tracking is enabled
+                    if not self.issue_tracking_enabled:
+                        logger.info(f"Issue tracking disabled, not closing issue #{issue_number}")
+                        # 仅回复确认消息，不关闭 Issue
+                        if github:
+                            github.create_issue_comment(
+                                owner, repo, issue_number,
+                                "✅ 收到您的反馈，很高兴问题已解决！\n\n（管理员已禁用自动关闭 Issue 功能，如需关闭请手动操作）"
+                            )
+                        # 记录评论已处理
+                        if state and comment_id:
+                            state.record_comment(comment_id)
+                            self.state_manager.save_state(state)
+                        return ProcessingResult(
+                            status=ProcessingStatus.COMPLETED,
+                            issue_number=issue_number,
+                            message="Resolution acknowledged but auto-close is disabled"
+                        )
+                    
+                    # User confirmed issue is resolved -> close it
+                    if github:
+                        self.followup_manager.close_if_resolved(owner, repo, issue_number, github)
+                        self.state_manager.record_action(repo_full_name, issue_number, "closed")
+                        # 记录评论已处理
+                        if state and comment_id:
+                            state.record_comment(comment_id)
+                            self.state_manager.save_state(state)
+                        return ProcessingResult(
+                            status=ProcessingStatus.COMPLETED,
+                            issue_number=issue_number,
+                            message="Issue resolved and closed based on user confirmation"
+                        )
+                elif followup_result is False:
+                    # User explicitly said issue is NOT resolved
+                    # Reply with acknowledgment and continue normal processing
+                    if github:
+                        github.create_issue_comment(
+                            owner, repo, issue_number,
+                            "收到，我会继续跟进这个问题。请告诉我具体的错误信息或需要调整的地方。"
+                        )
+                    # 记录评论已处理
+                    if state and comment_id:
+                        state.record_comment(comment_id)
+                        self.state_manager.save_state(state)
+                    # Fall through to normal processing (don't return here)
+                else:
+                    # followup_result is None - check with fallback method
+                    # This catches cases where user says "已解决" but _check_followup_reply
+                    # returned None due to new_request_keywords filtering
+                    if self._check_close_keywords(context.current_instruction or ""):
+                        # 检查 Issue 是否已经是关闭状态
+                        if current_issue_state == "closed":
+                            logger.info(f"Issue #{issue_number} is already closed, skipping")
+                            if state and comment_id:
+                                state.record_comment(comment_id)
+                                self.state_manager.save_state(state)
+                            return ProcessingResult(
+                                status=ProcessingStatus.SKIPPED,
+                                issue_number=issue_number,
+                                message="Issue already closed"
+                            )
+                        
+                        # Check if issue tracking is enabled
+                        if not self.issue_tracking_enabled:
+                            logger.info(f"Issue tracking disabled, not closing issue #{issue_number}")
+                            # 仅回复确认消息，不关闭 Issue
+                            if github:
+                                github.create_issue_comment(
+                                    owner, repo, issue_number,
+                                    "✅ 收到您的反馈，很高兴问题已解决！\n\n（管理员已禁用自动关闭 Issue 功能，如需关闭请手动操作）"
+                                )
+                            # 记录评论已处理
+                            if state and comment_id:
+                                state.record_comment(comment_id)
+                                self.state_manager.save_state(state)
+                            return ProcessingResult(
+                                status=ProcessingStatus.COMPLETED,
+                                issue_number=issue_number,
+                                message="Resolution acknowledged but auto-close is disabled"
+                            )
+                        
+                        logger.info("Fallback close keyword detection triggered")
+                        if github:
+                            self.followup_manager.close_if_resolved(owner, repo, issue_number, github)
+                            self.state_manager.record_action(repo_full_name, issue_number, "closed")
+                            # 记录评论已处理
+                            if state and comment_id:
+                                state.record_comment(comment_id)
+                                self.state_manager.save_state(state)
+                            return ProcessingResult(
+                                status=ProcessingStatus.COMPLETED,
+                                issue_number=issue_number,
+                                message="Issue closed based on close keywords (fallback detection)"
+                            )
             
             # Phase 2: Intent recognition (Cloud Agent)
             if self.cloud_agent:
@@ -127,6 +300,17 @@ class IssueProcessor:
                     processing_count
                 )
                 logger.info(f"Detected intent: {intent.intent.value} (confidence: {intent.confidence:.2f})")
+                
+                # Check for explicit user modification request
+                if self._check_explicit_modify_request(context):
+                    logger.info("User explicitly requested code modification, overriding intent to MODIFY")
+                    intent = IntentResult(
+                        intent=IntentType.MODIFY,
+                        confidence=0.95,
+                        reasoning="User explicitly requested code modification",
+                        needs_research=False,
+                        research_topics=[]
+                    )
             else:
                 # Fallback: assume modify intent
                 intent = IntentResult(
@@ -194,6 +378,22 @@ class IssueProcessor:
     
     def _should_process(self, event: GitHubEvent) -> bool:
         """Check if event should be processed based on trigger mode"""
+        # 对于评论事件，先检查是否是关闭/解决指令（这些不需要 @agent）
+        if event.event_type == "issue_comment":
+            comment = event.comment or {}
+            body = comment.get("body", "")
+            body_lower = body.lower()
+            
+            # 关闭/解决关键词 - 这些指令可以直接触发处理
+            resolution_keywords = [
+                "已解决", "解决了", "搞定", "可以关闭", "关闭吧", "没问题了",
+                "可以了", "ok了", "ok", "fixed", "resolved", "close", "solved",
+                "测试通过", "验证通过", "完美", "不用了", "works", "working"
+            ]
+            if any(kw in body_lower for kw in resolution_keywords):
+                logger.info("Detected resolution keywords in comment, will process to close issue")
+                return True
+        
         if event.event_type == "issues":
             # Issue events
             if self.issue_trigger_mode == "auto":
@@ -307,12 +507,19 @@ class IssueProcessor:
             github.create_issue_comment(owner, repo, issue_number, explanation)
         
         # Update state
-        self.state_manager.record_action(repo, issue_number, "answered")
+        repo_full_name = f"{owner}/{repo}"
+        self.state_manager.record_action(repo_full_name, issue_number, "answered")
         self.state_manager.save_state(IssueState(
             issue_number=issue_number,
-            repo_full_name=f"{owner}/{repo}",
+            repo_full_name=repo_full_name,
             intent=intent.intent
         ))
+        
+        # Schedule follow-up check (if issue tracking is enabled)
+        if self.issue_tracking_enabled:
+            self.followup_manager.schedule_follow_up(owner, repo, issue_number, github)
+        else:
+            logger.debug(f"Issue tracking disabled, skipping follow-up scheduling for issue #{issue_number}")
         
         return ProcessingResult(
             status=ProcessingStatus.COMPLETED,
@@ -369,7 +576,28 @@ class IssueProcessor:
         try:
             # Get installation token
             github = self._get_github_client(installation_id)
-            token = github.get_installation_token(installation_id) if github and hasattr(github, 'get_installation_token') else None
+            token = None
+            if github and hasattr(github, 'get_installation_token'):
+                try:
+                    token = github.get_installation_token()
+                    logger.info(f"✅ Got installation token for installation {str(installation_id)[:10]}...")
+                except Exception as e:
+                    logger.error(f"❌ Failed to get installation token: {e}")
+            elif github and hasattr(github, 'auth') and github.auth:
+                # Fallback to auth manager
+                try:
+                    token = github.auth.get_installation_token(installation_id)
+                    logger.info(f"✅ Got installation token via auth manager")
+                except Exception as e:
+                    logger.error(f"❌ Failed to get installation token: {e}")
+            else:
+                logger.warning("⚠️  GitHub client not available or missing get_installation_token method")
+            
+            # Check if token was obtained
+            if token:
+                logger.info(f"✅ GitHub token obtained (length: {len(token)})")
+            else:
+                logger.error("❌ Failed to obtain GitHub token - code push will likely fail!")
             
             # Execute code changes
             logger.info("Executing code changes...")
@@ -388,41 +616,83 @@ class IssueProcessor:
                 pr_number = exec_result.get("pr_number")
                 pr_url = exec_result.get("pr_url")
                 files_modified = exec_result.get("files_modified", [])
+                branch = exec_result.get("branch", f"agent-fix-{issue_number}")
+                exec_message = exec_result.get("message", "")
                 
-                # Update state
-                self.state_manager.record_action(
-                    repo, issue_number, "modified",
-                    pr_number=pr_number,
-                    files=files_modified
-                )
-                self.state_manager.save_state(IssueState(
+                logger.info(f"Code execution completed. PR: {pr_number}, Files: {files_modified}")
+                
+                # Update state - record action
+                repo_full_name = f"{owner}/{repo}"
+                self.state_manager.record_action(repo_full_name, issue_number, "modified")
+                
+                # Update PR info if available
+                if pr_number and pr_url:
+                    self.state_manager.update_pr_info(
+                        repo_full_name, issue_number, 
+                        pr_number=pr_number,
+                        pr_url=pr_url,
+                        branch_name=branch
+                    )
+                
+                # Save state with files modified
+                state = IssueState(
                     issue_number=issue_number,
-                    repo_full_name=f"{owner}/{repo}",
-                    intent=intent.intent,
-                    pull_request_number=pr_number,
-                    files_modified=files_modified
-                ))
+                    repo_full_name=repo_full_name,
+                    intent=intent.intent
+                )
+                if pr_number:
+                    state.pull_request_number = pr_number
+                if files_modified:
+                    state.files_modified = files_modified
+                self.state_manager.save_state(state)
                 
-                # Reply to issue
-                message = f"""🤖 代码修改完成
+                # Build reply message
+                if pr_number and pr_url:
+                    # PR created successfully
+                    message = f"""🤖 代码修改完成
 
-我创建了一个 PR #{pr_number} 来解决这个问题：{pr_url}
+✅ 我已创建 PR #{pr_number} 来解决这个问题：
+{pr_url}
 
 **修改的文件**:
 {chr(10).join([f'- `{f}`' for f in files_modified])}
 
 请查看并确认修改是否符合预期。如果需要调整，请告诉我具体问题。"""
+                else:
+                    # Branch pushed but PR creation failed
+                    message = f"""🤖 代码修改完成
+
+⚠️ 我已推送代码到分支 `{branch}`，但 PR 创建失败。
+{exec_message}
+
+**修改的文件**:
+{chr(10).join([f'- `{f}`' for f in files_modified])}
+
+请手动创建 PR 或联系管理员检查 GitHub App 权限。"""
                 
+                # Send reply
                 github = self._get_github_client(installation_id)
                 if github:
-                    github.create_issue_comment(owner, repo, issue_number, message)
+                    try:
+                        github.create_issue_comment(owner, repo, issue_number, message)
+                        logger.info(f"✅ Reply sent to issue #{issue_number}")
+                    except Exception as e:
+                        logger.error(f"❌ Failed to send reply: {e}")
+                else:
+                    logger.error("❌ GitHub client not available, cannot send reply")
+                
+                # Schedule follow-up check if PR was created (and issue tracking is enabled)
+                if pr_number and self.issue_tracking_enabled:
+                    self.followup_manager.schedule_follow_up(owner, repo, issue_number, github)
+                elif pr_number:
+                    logger.debug(f"Issue tracking disabled, skipping follow-up scheduling for issue #{issue_number}")
                 
                 return ProcessingResult(
                     status=ProcessingStatus.COMPLETED,
                     issue_number=issue_number,
                     intent=intent.intent,
                     pr_number=pr_number,
-                    message=f"PR created: #{pr_number}"
+                    message=f"PR created: #{pr_number}" if pr_number else f"Branch pushed: {branch}"
                 )
             else:
                 # Execution failed
@@ -469,34 +739,109 @@ class IssueProcessor:
         """Handle research intent - query knowledge base"""
         logger.info(f"Handling research intent for issue #{issue_number}")
         
-        # Query knowledge base
+        # Check if this might actually need code modification
+        full_text = context.build_full_context().lower()
+        code_indicators = [
+            "can't", "not working", "error", "exception", "bug", "fix",
+            "代码", "报错", "错误", "异常", "运行", "执行",
+            "```", "def ", "class ", "import ", "function"
+        ]
+        has_code_context = any(indicator in full_text for indicator in code_indicators)
+        
+        if has_code_context:
+            logger.info(f"Detected code context in research query, will provide modification guidance")
+        
+        # Query knowledge base directly
         kb_answer = None
-        if self.knowledge_base:
+        kb_source = ""
+        kb_similarity = 0.0
+        
+        # Access KB client through knowledge_base (KBIntegrator)
+        kb_client = None
+        if self.knowledge_base and hasattr(self.knowledge_base, 'client'):
+            kb_client = self.knowledge_base.client
+        
+        if kb_client:
             query = f"{context.title}\n{context.body}"
+            logger.info(f"Querying KB: {query[:100]}...")
             
-            # Try to get solution from KB
-            suggestion = self.knowledge_base.get_solution_suggestion(query)
-            
-            if suggestion:
-                kb_answer = suggestion['answer']
-                logger.info(f"Found KB solution with similarity {suggestion['similarity']:.2f}")
+            try:
+                kb_result = kb_client.query(query, top_k=3, generate_answer=True)
+                
+                if kb_result and kb_result.get('results'):
+                    results = kb_result['results']
+                    if results:
+                        best_match = results[0]
+                        kb_similarity = best_match.get('similarity', 0)
+                        
+                        # Use lower threshold for research queries (0.4 instead of 0.7)
+                        if kb_similarity >= 0.4:
+                            # Build answer from results
+                            if kb_result.get('answer'):
+                                kb_answer = kb_result['answer']
+                            else:
+                                # Build from best result text
+                                kb_answer = best_match.get('text', '')[:1000]
+                            
+                            kb_source = best_match.get('metadata', {}).get('source', '')
+                            logger.info(f"Found KB answer with similarity {kb_similarity:.2f}")
+                        else:
+                            logger.info(f"KB match similarity {kb_similarity:.2f} below threshold 0.4")
+                else:
+                    logger.info("No KB results found")
+            except Exception as e:
+                logger.error(f"KB query failed: {e}")
+        else:
+            logger.warning("KB client not available")
         
         # Build response
         if kb_answer:
             # KB found answer
-            reply = f"""🤖 [知识库自动回答]
-
-{kb_answer}
-
----
-📚 **参考文档**: {suggestion['source']}
-🎯 **匹配度**: {suggestion['similarity']:.1%}
-
-如果以上信息未能解决您的问题，请提供更多细节，我可以进一步分析。"""
+            reply_parts = ["🤖 [知识库查询结果]", "", kb_answer, ""]
+            
+            # Add modification guidance if code context detected
+            if has_code_context:
+                reply_parts.extend([
+                    "---",
+                    "🔧 **代码修改建议**",
+                    "",
+                    "我注意到您的问题可能涉及代码实现。基于知识库信息，建议：",
+                    "",
+                    "1. 根据上述技术规格检查您的代码实现",
+                    "2. 确认配置参数是否符合芯片要求",
+                    "3. 如有需要，回复 `请帮我修改代码`，我可以协助生成修复代码",
+                    ""
+                ])
+            
+            reply_parts.extend([
+                "---",
+                f"📚 **参考文档**: {kb_source}",
+                f"🎯 **匹配度**: {kb_similarity:.1%}",
+                "",
+                "如果以上信息未能解决您的问题，请：",
+                "- 提供更多细节，我可以进一步分析",
+            ])
+            
+            if has_code_context:
+                reply_parts.append("- 或回复 `请帮我修改代码` 让我直接协助修复")
+            
+            reply = "\n".join(reply_parts)
         else:
             # No KB match
-            if hasattr(action_plan, 'response') and action_plan.response:
-                reply = action_plan.response
+            if has_code_context:
+                reply = """🤖 我理解您遇到了代码问题。
+
+我尝试查询了相关知识库，但没有找到直接匹配的技术文档。
+
+**建议**：
+1. 请确认芯片/模块型号是否正确
+2. 提供相关的代码片段，我可以尝试直接分析并修复
+3. 或回复 `请帮我修改代码`，我将基于您的代码生成修复方案
+
+**您的需求**：
+"""
+                if intent.research_topics:
+                    reply += f"涉及: {', '.join(intent.research_topics)}\n"
             else:
                 reply = "🤖 我需要进一步分析这个问题。\n\n"
                 if intent.research_topics:
@@ -508,18 +853,25 @@ class IssueProcessor:
             github.create_issue_comment(owner, repo, issue_number, reply)
         
         # Update state
-        self.state_manager.record_action(repo, issue_number, "researched")
+        repo_full_name = f"{owner}/{repo}"
+        self.state_manager.record_action(repo_full_name, issue_number, "researched")
         self.state_manager.save_state(IssueState(
             issue_number=issue_number,
-            repo_full_name=f"{owner}/{repo}",
+            repo_full_name=repo_full_name,
             intent=intent.intent
         ))
+        
+        # Schedule follow-up check (if issue tracking is enabled)
+        if self.issue_tracking_enabled:
+            self.followup_manager.schedule_follow_up(owner, repo, issue_number, github)
+        else:
+            logger.debug(f"Issue tracking disabled, skipping follow-up scheduling for issue #{issue_number}")
         
         return ProcessingResult(
             status=ProcessingStatus.COMPLETED,
             issue_number=issue_number,
             intent=intent.intent,
-            message="Knowledge base query completed" + (" (with answer)" if kb_answer else " (no match)")
+            message="Knowledge base query completed" + (" (with answer)" if kb_answer else " (no match)") + (" [code context detected]" if has_code_context else "")
         )
     
     def _handle_clarify_intent(
@@ -547,6 +899,10 @@ class IssueProcessor:
         if github:
             github.create_issue_comment(owner, repo, issue_number, reply)
         
+        # Update state (no follow-up for clarification requests)
+        repo_full_name = f"{owner}/{repo}"
+        self.state_manager.record_action(repo_full_name, issue_number, "clarified")
+        
         return ProcessingResult(
             status=ProcessingStatus.SKIPPED,
             issue_number=issue_number,
@@ -566,3 +922,85 @@ class IssueProcessor:
         if event.issue:
             return event.issue.get("number", 0)
         return 0
+    
+    def _check_explicit_modify_request(self, context: IssueContext) -> bool:
+        """
+        Check if user explicitly requested code modification
+        
+        This overrides the AI intent classification when user clearly asks for code changes.
+        """
+        text = (context.current_instruction or "").lower()
+        
+        # Explicit modification request patterns
+        modify_patterns = [
+            "请帮我修改代码", "请修改代码", "帮我改代码",
+            "请生成修复代码", "请帮我修复", "请修复代码",
+            "请帮我实现", "请实现代码", "帮我写代码",
+            "modify the code", "fix the code", "help me fix",
+            "generate the fix", "provide the code", "write the code"
+        ]
+        
+        for pattern in modify_patterns:
+            if pattern in text:
+                logger.info(f"Detected explicit modification request: '{pattern}'")
+                return True
+        
+        return False
+    
+    def _check_followup_reply(self, context: IssueContext) -> Optional[bool]:
+        """
+        Check if this is a reply to our follow-up comment
+        
+        Returns:
+            True: User confirms issue is resolved -> close issue
+            False: User says issue is NOT resolved -> continue processing
+            None: Not a follow-up reply -> proceed with normal intent classification
+        """
+        text = (context.current_instruction or "").lower()
+        
+        # Check for resolution keywords
+        result = self.followup_manager.check_resolution_keywords(text)
+        
+        if result is True:
+            logger.info("Detected follow-up reply confirming resolution")
+            return True
+        elif result is False:
+            logger.info("Detected follow-up reply: issue NOT resolved, will continue processing")
+            return False
+        
+        return None
+    
+    def _check_close_keywords(self, text: str) -> bool:
+        """
+        Direct check for close/resolve keywords
+        This is used as a fallback when _check_followup_reply returns None
+        
+        Returns:
+            True: Text contains close/resolve keywords
+            False: No close keywords found
+        """
+        if not text:
+            return False
+            
+        text_lower = text.lower()
+        
+        # Extended list of close/resolve keywords
+        close_keywords = [
+            # Chinese
+            "已解决", "解决了", "搞定", "可以关闭", "关闭吧", "没问题了",
+            "可以了", "ok了", "ok", "完美", "不用了", "取消",
+            "测试通过", "验证通过", "没有问题", "完成", "结束",
+            "谢谢", "感谢", "多谢",
+            # English
+            "fixed", "resolved", "solved", "close", "closing", "closed",
+            "works", "working", "worked", "great", "perfect", "awesome",
+            "thank", "thanks", "verified", "done", "completed", "it works"
+        ]
+        
+        # Check for positive keywords
+        for kw in close_keywords:
+            if kw in text_lower:
+                logger.info(f"Detected close keyword: '{kw}'")
+                return True
+        
+        return False

@@ -4,17 +4,22 @@ Wraps GitHub REST API calls with authentication
 """
 
 import base64
+import logging
 import requests
 from typing import Optional, Dict, Any, List
 from .auth_manager import GitHubAuthManager
+
+logger = logging.getLogger(__name__)
 
 
 class GitHubClient:
     """GitHub API client for repository operations"""
     
-    def __init__(self, auth_manager: GitHubAuthManager, installation_id: str = None):
+    def __init__(self, auth_manager: GitHubAuthManager = None, installation_id = None, token: str = None):
         self.auth = auth_manager
-        self.installation_id = installation_id
+        # Ensure installation_id is stored as string
+        self.installation_id = str(installation_id) if installation_id is not None else None
+        self._token = token  # Direct token for code executor
         self.base_url = "https://api.github.com"
     
     def with_installation(self, installation_id: str) -> 'GitHubClient':
@@ -23,7 +28,14 @@ class GitHubClient:
     
     def _get_headers(self) -> Dict[str, str]:
         """Get authenticated request headers"""
-        token = self.auth.get_installation_token(self.installation_id)
+        # Use direct token if provided (for code executor)
+        if self._token:
+            token = self._token
+        elif self.auth:
+            token = self.auth.get_installation_token(self.installation_id)
+        else:
+            raise RuntimeError("No authentication available")
+        
         return {
             "Authorization": f"token {token}",
             "Accept": "application/vnd.github.v3+json",
@@ -58,6 +70,20 @@ class GitHubClient:
         response = requests.post(url, headers=self._get_headers(), json=data)
         response.raise_for_status()
         return response.json()
+    
+    def close_issue(self, owner: str, repo: str, issue_number: int) -> bool:
+        """Close an issue"""
+        url = f"{self.base_url}/repos/{owner}/{repo}/issues/{issue_number}"
+        data = {"state": "closed"}
+        
+        try:
+            response = requests.patch(url, headers=self._get_headers(), json=data)
+            response.raise_for_status()
+            logger.info(f"✅ Closed issue #{issue_number}")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Failed to close issue #{issue_number}: {e}")
+            return False
     
     def get_file_content(self, owner: str, repo: str, path: str, ref: str = "main") -> Optional[str]:
         """Get file content from repository"""
@@ -135,8 +161,11 @@ class GitHubClient:
         base: str = "main",
         body: str = "",
         issue_number: Optional[int] = None
-    ) -> Dict[str, Any]:
+    ) -> Optional[Dict[str, Any]]:
         """Create a pull request"""
+        import logging
+        logger = logging.getLogger(__name__)
+        
         url = f"{self.base_url}/repos/{owner}/{repo}/pulls"
         
         # Link to issue if provided
@@ -150,11 +179,60 @@ class GitHubClient:
             "body": body
         }
         
-        response = requests.post(url, headers=self._get_headers(), json=data)
+        logger.info(f"Creating PR: {title}")
+        logger.debug(f"  URL: {url}")
+        logger.debug(f"  Head: {head} -> Base: {base}")
+        
+        try:
+            response = requests.post(url, headers=self._get_headers(), json=data)
+            
+            if response.status_code == 201:
+                result = response.json()
+                logger.info(f"✅ PR created: #{result['number']} - {result['html_url']}")
+                return result
+            elif response.status_code == 422:
+                # PR already exists or validation error
+                error_data = response.json()
+                logger.error(f"❌ PR creation failed (422): {error_data}")
+                # Try to find existing PR
+                try:
+                    existing = self.get_pull_request_by_branch(owner, repo, head)
+                    if existing:
+                        logger.info(f"Found existing PR: #{existing['number']}")
+                        return existing
+                except:
+                    pass
+                return None
+            else:
+                logger.error(f"❌ PR creation failed: {response.status_code} - {response.text}")
+                response.raise_for_status()
+        except Exception as e:
+            logger.exception(f"❌ Failed to create PR: {e}")
+            return None
+    
+    def get_pull_request_by_branch(self, owner: str, repo: str, head: str) -> Optional[Dict[str, Any]]:
+        """Find existing PR by branch"""
+        url = f"{self.base_url}/repos/{owner}/{repo}/pulls"
+        params = {"head": f"{owner}:{head}", "state": "open"}
+        
+        response = requests.get(url, headers=self._get_headers(), params=params)
         response.raise_for_status()
-        return response.json()
+        
+        prs = response.json()
+        if prs:
+            return prs[0]
+        return None
+    
+    def get_installation_token(self) -> str:
+        """Get installation access token"""
+        if self._token:
+            return self._token
+        if self.auth:
+            # Ensure installation_id is string
+            return self.auth.get_installation_token(str(self.installation_id))
+        raise RuntimeError("No authentication available")
     
     def get_clone_url(self, owner: str, repo: str) -> str:
         """Get authenticated clone URL"""
-        token = self.auth.get_installation_token(self.installation_id)
+        token = self.get_installation_token()
         return f"https://x-access-token:{token}@github.com/{owner}/{repo}.git"

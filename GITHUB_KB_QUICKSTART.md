@@ -103,6 +103,122 @@ knowledge-base/           # GitHub 仓库根目录
 
 ---
 
+## 🔍 查询知识库
+
+### 方式 1: 使用查询工具（推荐）
+
+```bash
+# 查看完整状态
+python scripts/kb_query.py
+
+# 查询特定内容
+python scripts/kb_query.py 'SAMD21 芯片规格'
+
+# 查看统计
+python scripts/kb_query.py -s
+
+# 列出本地文件
+python scripts/kb_query.py -l
+
+# 重新加载知识库（同步后使用）
+python scripts/kb_query.py -r
+```
+
+### 方式 2: 直接 API 调用
+
+```bash
+# 查看统计
+curl http://localhost:8000/stats
+
+# 健康检查
+curl http://localhost:8000/health
+
+# 查询知识库
+curl -X POST http://localhost:8000/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "SAMD21", "top_k": 3}'
+```
+
+### 方式 3: 查看原始文件
+
+```bash
+# 芯片文档
+ls -la knowledge_base/chips/
+cat knowledge_base/chips/SAMD21.md
+
+# 最佳实践
+ls -la knowledge_base/best_practices/
+cat knowledge_base/best_practices/README.md
+```
+
+---
+
+## 📊 向量化说明
+
+### 什么是向量化？
+
+知识库使用 **nomic-embed-text** 模型将文本转换为 768 维向量：
+
+```
+文本: "SAMD21 是一款 ARM Cortex-M0+ 微控制器"
+      ↓
+向量: [0.023, -0.156, 0.089, ..., 0.034] (768 个数字)
+      ↓
+存储: 内存中的向量库
+```
+
+### 向量库特点
+
+| 特性 | 说明 |
+|------|------|
+| 存储位置 | 内存中（启动时加载） |
+| 向量维度 | 768 维 |
+| 相似度算法 | 余弦相似度 |
+| 持久化 | 原始 Markdown 文件 |
+
+### 为什么向量在内存中？
+
+1. **快速查询** - 内存访问比磁盘快 1000 倍
+2. **实时更新** - 修改文件后重新加载即可
+3. **无需数据库** - 简化部署，适合中小规模知识库
+
+---
+
+## 🔄 同步流程
+
+```
+GitHub Push
+    ↓
+Webhook 触发 / 定时同步
+    ↓
+download_file() - 下载原始文件
+    ↓
+convert_to_markdown() - 转换格式
+    ↓
+保存到 knowledge_base/chips/
+    ↓
+通知 KB Service /reload
+    ↓
+重新生成向量嵌入
+    ↓
+完成！
+```
+
+### 手动同步命令
+
+```bash
+# 立即同步一次
+python scripts/github_repo_watcher.py --sync
+
+# 强制重新同步所有文件
+python scripts/github_repo_watcher.py --sync --force
+
+# 后台持续监控
+python scripts/github_repo_watcher.py --daemon --interval 300
+```
+
+---
+
 ## 🔍 查看同步状态
 
 ```bash
@@ -168,6 +284,25 @@ sudo apt-get install poppler-utils
 which pdftotext
 ```
 
+### 文档数量为 0？
+
+**原因:**
+1. GitHub 同步未启用
+2. 同步尚未完成
+3. 知识库未重新加载
+
+**解决:**
+```bash
+# 1. 检查配置
+grep KB_GITHUB_SYNC_ENABLED .env
+
+# 2. 手动同步
+python scripts/github_repo_watcher.py --sync
+
+# 3. 重新加载
+python scripts/kb_query.py -r
+```
+
 ---
 
 ## 💡 最佳实践
@@ -187,6 +322,5 @@ which pdftotext
 
 ## 📚 相关文档
 
-- [知识库完整指南](./knowledge_base/README.md)
 - [项目架构设计](./ARCHITECTURE.md)
 - [主 README](./README.md)

@@ -48,7 +48,10 @@ class StateManager:
                 pull_request_url=data.get("pull_request_url", ""),
                 branch_name=data.get("branch_name", ""),
                 processing_count=data.get("processing_count", 0),
-                last_action=data.get("last_action", "")
+                last_action=data.get("last_action", ""),
+                follow_up_count=data.get("follow_up_count", 0),
+                processed_comment_ids=data.get("processed_comment_ids", []),
+                issue_state=data.get("issue_state", "")
             )
         except Exception as e:
             logger.error(f"Failed to load state: {e}")
@@ -67,7 +70,10 @@ class StateManager:
             "pull_request_url": state.pull_request_url,
             "branch_name": state.branch_name,
             "processing_count": state.processing_count,
-            "last_action": state.last_action
+            "last_action": state.last_action,
+            "follow_up_count": getattr(state, 'follow_up_count', 0),
+            "processed_comment_ids": getattr(state, 'processed_comment_ids', []),
+            "issue_state": getattr(state, 'issue_state', "")
         }
         
         try:
