@@ -1,0 +1,109 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+.venv-*/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+logs/
+*.log.*
+
+# State and cache
+state/
+*.state
+cache/
+*.cache
+
+# Working directories
+/tmp/github-agent-v2/
+work/
+workspace/
+
+# Knowledge base (synced from GitHub)
+knowledge_base/chips/*
+knowledge_base/best_practices/*
+!knowledge_base/chips/.gitkeep
+!knowledge_base/best_practices/.gitkeep
+
+# Test coverage
+.coverage
+htmlcov/
+.tox/
+.nox/
+.pytest_cache/
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+
+# MyPy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# PyBuilder
+.pybuilder/
+target/
+
+# Docs build
+docs/_build/
+docs/_static/
+docs/_templates/
+
+# Local configuration
+config.local.yaml
+config.local.yml
+*.local.json
+
+# GitHub App private keys (security)
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
