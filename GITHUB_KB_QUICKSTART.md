@@ -139,6 +139,87 @@ curl -X POST http://localhost:8000/query \
   -d '{"query": "SAMD21", "top_k": 3}'
 ```
 
+---
+
+## 🧪 测试验证
+
+验证向量检索功能是否正常工作。
+
+### 快速测试
+
+```bash
+# 1. 检查知识库状态（查看 HNSW 是否启用）
+python scripts/kb_query.py -s
+
+# 预期输出包含：
+# - 文档总数
+# - 向量存储: HNSW（或 brute_force）
+# - 向量维度: 768
+
+# 2. 使用调试模式查询（显示存储后端、耗时等）
+python scripts/kb_query.py "芯片规格" -d
+
+# 调试输出示例：
+# [DEBUG] 向量存储信息:
+#   后端类型: HNSW
+#   向量维度: 768
+#   距离度量: cosine
+#   检索耗时: 0.23ms
+```
+
+### 向量检索测试
+
+```bash
+# 2. 执行语义检索测试
+python scripts/kb_query.py "芯片规格参数" -k 3
+
+# 3. 测试不同类型的查询
+python scripts/kb_query.py "GPIO 引脚配置" -k 3
+python scripts/kb_query.py "I2C 通信协议" -k 3
+```
+
+### 性能测试
+
+```bash
+# 4. 测试检索性能（使用 Python）
+python3 << 'EOF'
+import time
+import requests
+
+KB_URL = "http://localhost:8000"
+queries = [
+    "SAMD21 芯片规格",
+    "GPIO 引脚配置", 
+    "PWM 输出设置",
+]
+
+print("🔍 向量检索性能测试")
+print("=" * 60)
+
+for q in queries:
+    start = time.time()
+    resp = requests.post(f"{KB_URL}/query",
+        json={"query": q, "top_k": 3},
+        timeout=10)
+    elapsed = (time.time() - start) * 1000
+    
+    found = resp.json().get('total_found', 0)
+    print(f"查询: {q[:20]:20s} | 结果: {found} | 耗时: {elapsed:.2f}ms")
+
+print("=" * 60)
+print("✅ 正常: HNSW 模式下耗时 < 1ms, 简单模式耗时 ~10-100ms")
+EOF
+```
+
+### 故障排查
+
+| 问题 | 检查方法 | 解决方案 |
+|------|---------|---------|
+| 服务未启动 | `curl http://localhost:8000/health` | 启动 KB Service: `python -m knowledge_base.kb_service` |
+| 文档数为 0 | `python scripts/kb_query.py -l` | 检查知识库文件是否存在，执行重新加载: `-r` |
+| HNSW 未启用 | `kb_query.py -s` 查看后端类型 | 安装 hnswlib: `pip install hnswlib` |
+| 查询无结果 | 检查文件内容编码 | 确保 Markdown 文件为 UTF-8 编码 |
+
 ### 方式 3: 查看原始文件
 
 ```bash

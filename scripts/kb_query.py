@@ -21,6 +21,21 @@ def check_stats():
         print(f"文档总数: {data.get('total_documents', 0)}")
         print(f"嵌入模型: {data.get('embedding_model', 'unknown')}")
         print(f"数据目录: {data.get('data_dir', 'unknown')}")
+        
+        # 显示向量存储信息
+        vs_stats = data.get('vector_store', {})
+        if vs_stats:
+            print(f"\n📦 向量存储:")
+            print(f"  后端类型: {vs_stats.get('index_type', 'simple').upper()}")
+            if vs_stats.get('dim'):
+                print(f"  向量维度: {vs_stats.get('dim')}")
+            if vs_stats.get('space'):
+                print(f"  距离度量: {vs_stats.get('space')}")
+            if vs_stats.get('M'):
+                print(f"  HNSW M: {vs_stats.get('M')}")
+            if vs_stats.get('ef'):
+                print(f"  HNSW ef: {vs_stats.get('ef')}")
+        
         print("=" * 50)
         return data.get('total_documents', 0)
     except Exception as e:
@@ -39,7 +54,7 @@ def check_health():
         print(f"❌ 服务未启动: {e}")
         return False
 
-def query_knowledge(query: str, top_k: int = 3):
+def query_knowledge(query: str, top_k: int = 3, debug: bool = False):
     """查询知识库"""
     try:
         resp = requests.post(
@@ -52,11 +67,29 @@ def query_knowledge(query: str, top_k: int = 3):
         print(f"\n🔍 查询: {query}")
         print("=" * 60)
         
+        # 调试信息
+        if debug:
+            vs_info = data.get('vector_store', {})
+            print(f"\n[DEBUG] 向量存储信息:")
+            print(f"  后端类型: {vs_info.get('index_type', 'simple').upper()}")
+            if vs_info.get('dim'):
+                print(f"  向量维度: {vs_info.get('dim')}")
+            if vs_info.get('space'):
+                print(f"  距离度量: {vs_info.get('space')}")
+            if vs_info.get('total_documents'):
+                print(f"  文档总数: {vs_info.get('total_documents')}")
+            if 'elapsed_ms' in data:
+                print(f"  检索耗时: {data.get('elapsed_ms', 0):.2f}ms")
+            print()
+        
         if data.get('total_found', 0) == 0:
             print("❌ 未找到相关信息")
             return
         
-        print(f"✅ 找到 {data.get('total_found', 0)} 条结果\n")
+        print(f"✅ 找到 {data.get('total_found', 0)} 条结果")
+        if data.get('elapsed_ms'):
+            print(f"⏱️  检索耗时: {data.get('elapsed_ms', 0):.2f}ms")
+        print()
         
         for i, result in enumerate(data.get('results', []), 1):
             print(f"--- 结果 {i} (相似度: {result.get('similarity', 0):.3f}) ---")
@@ -116,6 +149,7 @@ def main():
     parser.add_argument("-l", "--list", action="store_true", help="列出本地文件")
     parser.add_argument("-r", "--reload", action="store_true", help="重新加载知识库")
     parser.add_argument("--health", action="store_true", help="检查服务健康")
+    parser.add_argument("-d", "--debug", action="store_true", help="显示调试信息（存储后端、耗时等）")
     
     args = parser.parse_args()
     
@@ -128,7 +162,7 @@ def main():
     elif args.reload:
         reload_kb()
     elif args.query:
-        query_knowledge(args.query, args.top_k)
+        query_knowledge(args.query, args.top_k, args.debug)
     else:
         # 默认显示统计和文件列表
         check_health()
@@ -140,6 +174,7 @@ def main():
         print("  python scripts/kb_query.py -s               # 查看统计")
         print("  python scripts/kb_query.py -l               # 列出文件")
         print("  python scripts/kb_query.py -r               # 重新加载")
+        print("  python scripts/kb_query.py '查询' -d         # 调试模式")
 
 if __name__ == "__main__":
     main()

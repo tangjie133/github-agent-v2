@@ -185,3 +185,59 @@ sync.initialize_new_environment(sync_mode="full")
 # 或只拉取模式库（最小化）
 # sync.initialize_new_environment(sync_mode="minimal")
 ```
+
+---
+
+## 向量检索测试
+
+### 使用命令行工具
+
+```bash
+# 查看知识库统计信息（包含 HNSW 配置）
+python scripts/kb_query.py -s
+
+# 测试向量检索
+python scripts/kb_query.py "芯片参数查询" -k 5
+
+# 性能测试
+python scripts/kb_query.py "测试查询" --perf
+```
+
+### 使用 Python API
+
+```python
+from knowledge_base.kb_service import KnowledgeBaseService
+import time
+
+# 创建服务实例
+kb = KnowledgeBaseService()
+
+# 测试查询
+queries = ["SAMD21 规格", "GPIO 配置", "I2C 协议"]
+
+for q in queries:
+    start = time.time()
+    result = kb.query(q, top_k=3)
+    elapsed = (time.time() - start) * 1000
+    
+    print(f"查询: {q}")
+    print(f"  找到: {result['total_found']} 条结果")
+    print(f"  耗时: {elapsed:.2f}ms")
+    
+    for r in result['results']:
+        print(f"  - {r['metadata'].get('source', 'unknown')}: {r['similarity']:.3f}")
+
+# 查看向量存储统计
+stats = kb.get_stats()
+print(f"\n向量存储: {stats.get('vector_store', {})}")
+```
+
+### 预期性能指标
+
+| 指标 | HNSW 模式 | 简单模式 |
+|------|----------|---------|
+| 单次查询耗时 | < 1ms | 10-200ms |
+| 支持的文档数 | 10万+ | < 5000 |
+| 内存占用 | 中等 | 低 |
+
+**注意**: 如果 `hnswlib` 未安装，系统会自动降级到简单模式（暴力搜索）。

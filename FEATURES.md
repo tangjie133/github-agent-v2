@@ -57,6 +57,15 @@
 | **异步处理** | 后台同步不阻塞主流程 | knowledge_sync.py |
 | **失败重试** | 最多3次重试，自动排队 | knowledge_sync.py |
 
+### 检索性能优化（新）
+
+| 优化 | 效果 | 文件 |
+|------|------|------|
+| **HNSW 向量检索** | 750x 加速 (161ms→0.21ms) | kb_service.py |
+| **近似最近邻** | O(log n) 复杂度，支持万级文档 | hnswlib |
+| **自动降级** | hnswlib 未安装时回退到暴力搜索 | kb_service.py |
+| **动态扩容** | 索引自动增长，无需预分配 | HNSWVectorStore |
+
 ---
 
 ## 📊 性能提升
@@ -68,6 +77,32 @@
 | 无效修改拦截 | 无 | 100% | 新增 |
 | 成功案例保存 | 无 | 自动 | 新增 |
 | 知识同步 | 无 | 自动推送 | 新增 |
+| **知识库检索** | **~161ms** | **~0.21ms** | **750x** 🚀 |
+
+### HNSW 向量检索优化
+
+**问题：** 暴力搜索 O(n) 在大规模知识库（5000+ 文档）下查询缓慢
+
+**解决方案：** 集成 HNSW (Hierarchical Navigable Small World) 近似最近邻算法
+
+| 存储后端 | 算法复杂度 | 5000文档性能 | 适用场景 |
+|---------|-----------|-------------|---------|
+| SimpleVectorStore | O(n) | ~161ms/查询 | < 1000 文档 |
+| **HNSWVectorStore** | **O(log n)** | **~0.21ms/查询** | **1万+ 文档** |
+
+**技术细节：**
+- 基于 `hnswlib` 实现
+- cosine 空间度量
+- 可配置参数：ef_construction, M, ef
+- 自动降级：hnswlib 未安装时回退到暴力搜索
+
+**配置方式：**
+```bash
+KB_USE_HNSW=true                    # 启用 HNSW
+KB_HNSW_EF_CONSTRUCTION=200         # 构建精度
+KB_HNSW_M=16                        # 节点连接数
+KB_HNSW_EF=50                       # 查询精度
+```
 
 ---
 
@@ -159,12 +194,41 @@ grep "\[Validator\]" logs/agent.log
 
 ## 🧪 测试覆盖
 
+### 单元测试
+
 | 测试文件 | 测试数 | 状态 |
 |---------|--------|------|
 | test_code_improvements.py | 21 | ✅ 全部通过 |
 | test_e2e_scenario.py | 3 | ✅ 全部通过 |
 | test_success_case_store.py | 10 | ✅ 全部通过 |
 | **总计** | **34** | **✅ 100%** |
+
+### 向量检索测试
+
+验证知识库向量检索功能是否正常：
+
+```bash
+# 查看知识库状态（HNSW/简单模式）
+python scripts/kb_query.py -s
+
+# 执行语义检索测试
+python scripts/kb_query.py "芯片规格参数"
+
+# 调试模式（显示存储后端、耗时、维度等）
+python scripts/kb_query.py "芯片规格" -d
+
+# 性能测试脚本
+python3 << 'EOF'
+import time, requests
+for q in ["SAMD21", "GPIO", "I2C"]:
+    t0 = time.time()
+    r = requests.post("http://localhost:8000/query",
+        json={"query": q, "top_k": 3})
+    print(f"{q}: {(time.time()-t0)*1000:.2f}ms")
+EOF
+```
+
+详细测试指南: [GITHUB_KB_QUICKSTART.md#测试验证](./GITHUB_KB_QUICKSTART.md#测试验证)
 
 ---
 

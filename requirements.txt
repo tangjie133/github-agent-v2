@@ -20,8 +20,9 @@ pathlib>=1.0.1
 
 # Phase 3: Knowledge Base
 # chromadb>=0.4.0
-# sentence-transformers>=2.2.0
+# sentence-transformers>=2.2.2
 # numpy==1.26.4  # 固定在 1.26.4 避免兼容性问题
+hnswlib>=0.8.0  # HNSW 向量检索加速
 
 # Phase 4: Code Executor
 # 使用本地 Ollama，无需额外依赖

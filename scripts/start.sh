@@ -211,14 +211,17 @@ check_env() {
     echo "    评论: ${GITHUB_AGENT_COMMENT_TRIGGER_MODE:-smart}"
     echo "    确认模式: ${AGENT_CONFIRM_MODE:-auto}"
     
+    echo ""
+    echo "  ${BOLD}工作目录:${NC}"
+    echo "    WORKDIR: ${GITHUB_AGENT_WORKDIR:-/tmp/github-agent-v2}"
+    echo "    STATEDIR: ${GITHUB_AGENT_STATEDIR:-$PROJECT_DIR/.github_kb_sync_state.json}"
+    
     if is_debug; then
         echo ""
         echo "  ${BOLD}DEBUG 配置:${NC}"
         echo "    LOG_LEVEL: ${LOG_LEVEL}"
         echo "    KB_SERVICE_URL: ${KB_SERVICE_URL}"
         echo "    OLLAMA_HOST: ${OLLAMA_HOST}"
-        echo "    WORKDIR: ${GITHUB_AGENT_WORKDIR:-/tmp/github-agent-v2}"
-        echo "    STATEDIR: ${GITHUB_AGENT_STATEDIR:-$(dirname "$PROJECT_DIR")/.github_kb_sync_state.json}"
     fi
     
     # 代理状态
@@ -246,6 +249,8 @@ show_kb_status() {
         local stats=$(curl -s "$kb_url/stats" 2>/dev/null)
         local doc_count=$(echo "$stats" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('total_documents',0))" 2>/dev/null || echo "0")
         local model=$(echo "$stats" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('embedding_model','unknown'))" 2>/dev/null || echo "unknown")
+        local index_type=$(echo "$stats" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('vector_store',{}).get('index_type','unknown'))" 2>/dev/null || echo "unknown")
+        local dim=$(echo "$stats" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('vector_store',{}).get('dim','unknown'))" 2>/dev/null || echo "unknown")
         
         success "知识库服务就绪"
         echo ""
@@ -253,6 +258,19 @@ show_kb_status() {
         echo "    服务地址: ${CYAN}${kb_url}${NC}"
         echo "    文档数量: ${BOLD}${doc_count}${NC}"
         echo "    嵌入模型: ${CYAN}${model}${NC}"
+        
+        # 显示向量存储后端类型
+        if [ "$index_type" != "unknown" ]; then
+            if [ "$index_type" = "HNSW" ]; then
+                echo "    向量存储: ${GREEN}HNSW${NC} (高效近似最近邻)"
+            else
+                echo "    向量存储: ${YELLOW}${index_type}${NC} (暴力搜索)"
+            fi
+        fi
+        # 显示维度信息
+        if [ "$dim" != "unknown" ] && [ "$dim" != "None" ]; then
+            echo "    向量维度: ${dim}"
+        fi
         
         # DEBUG 模式下显示更多信息
         if is_debug; then
@@ -330,33 +348,53 @@ start_kb_service() {
         debug "检查命令: curl -s $KB_URL/health"
     fi
     
+    # 检查嵌入模型配置
+    EMBED_MODEL="${KB_EMBEDDING_MODEL:-nomic-embed-text}"
+    
     # 检查是否已有 KB Service 在运行
     if curl -s "$KB_URL/health" > /dev/null 2>&1; then
-        success "知识库服务已在运行"
-        echo ""
-        echo "  ${BOLD}服务地址:${NC} ${CYAN}${KB_URL}${NC}"
-        show_kb_status
-        return 0
+        # 检查当前运行的服务是否使用了正确的模型
+        local current_model=$(curl -s "$KB_URL/stats" 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('embedding_model','unknown'))" 2>/dev/null || echo "unknown")
+        
+        if [ "$current_model" = "$EMBED_MODEL" ]; then
+            success "知识库服务已在运行"
+            echo ""
+            echo "  ${BOLD}服务地址:${NC} ${CYAN}${KB_URL}${NC}"
+            show_kb_status
+            return 0
+        else
+            warning "知识库服务配置已变更: ${current_model} → ${EMBED_MODEL}"
+            info "正在重启 KB Service..."
+            # 停止现有服务
+            pkill -f "kb_service.py" 2>/dev/null || true
+            sleep 2
+        fi
     fi
-    
-    # 检查 nomic-embed-text 模型
     OLLAMA_HOST="${OLLAMA_HOST:-http://localhost:11434}"
-    if ! curl -s "$OLLAMA_HOST/api/tags" | grep -q "nomic-embed-text"; then
-        warning "nomic-embed-text 模型未找到，正在拉取..."
-        info "运行: ollama pull nomic-embed-text"
-        ollama pull nomic-embed-text || {
-            error "拉取 nomic-embed-text 模型失败"
+    
+    info "使用嵌入模型: ${EMBED_MODEL}"
+    
+    if ! curl -s "$OLLAMA_HOST/api/tags" | grep -q "${EMBED_MODEL}"; then
+        warning "${EMBED_MODEL} 模型未找到，正在拉取..."
+        info "运行: ollama pull ${EMBED_MODEL}"
+        ollama pull ${EMBED_MODEL} || {
+            error "拉取 ${EMBED_MODEL} 模型失败"
             return 1
         }
-        success "nomic-embed-text 模型已就绪"
+        success "${EMBED_MODEL} 模型已就绪"
     fi
     
     # 后台启动 KB Service（使用 setsid 确保进程组分离）
     info "正在启动 KB Service $KB_HOST:$KB_PORT..."
+    info "嵌入模型: ${EMBED_MODEL}"
     cd "$PROJECT_DIR"
     
     # 使用 setsid 创建新的会话，确保进程在后台持续运行
-    setsid python3 -m knowledge_base.kb_service --host "$KB_HOST" --port "$KB_PORT" > /tmp/kb_service.log 2>&1 &
+    # 传递嵌入模型配置
+    setsid python3 -m knowledge_base.kb_service \
+        --host "$KB_HOST" \
+        --port "$KB_PORT" \
+        --embedding-model "${EMBED_MODEL}" > /tmp/kb_service.log 2>&1 &
     KB_PID=$!
     
     # 等待服务启动
