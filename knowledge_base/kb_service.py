@@ -282,11 +282,12 @@ class KnowledgeBaseService:
             distance_fn="cosine"
         )
         
-        # 初始化 PDF 处理器
+        # 初始化 PDF 处理器（读取环境变量配置）
         try:
             from knowledge_base.pdf_processor import PDFProcessor
-            self.pdf_processor = PDFProcessor(embedder=self.embedder)
-            logger.info("PDF 处理器已初始化")
+            pdf_workers = int(os.environ.get("KB_PDF_WORKERS", 2))
+            self.pdf_processor = PDFProcessor(embedder=self.embedder, max_workers=pdf_workers)
+            logger.info(f"PDF 处理器已初始化 (线程数: {pdf_workers})")
         except ImportError as e:
             logger.warning(f"PDF 处理器初始化失败: {e}")
             self.pdf_processor = None
@@ -309,8 +310,11 @@ class KnowledgeBaseService:
             except Exception as e:
                 logger.debug(f"  服务状态: 异常 ({e})")
         
-        # 加载本地知识
+        # 加载本地知识（启动时只加载 Markdown，PDF 改为后台异步处理）
         self._load_local_knowledge()
+        
+        # 启动后台线程处理 PDF（避免阻塞启动）
+        self._start_pdf_background_processor()
         
         logger.info(f"知识库服务初始化完成，数据目录: {self.data_dir}")
     
@@ -328,10 +332,30 @@ class KnowledgeBaseService:
         
         return dirs
     
-    def _load_pdf_files(self):
-        """加载 PDF 文件（按页切分存储）"""
+    def _start_pdf_background_processor(self):
+        """启动后台线程处理 PDF 文件（避免阻塞启动）"""
+        import threading
+        
+        def process_pdfs_background():
+            """后台处理 PDF"""
+            try:
+                logger.info("🔄 后台 PDF 处理器启动")
+                self._load_pdf_files(background=True)
+                logger.info("✅ 后台 PDF 处理完成")
+            except Exception as e:
+                logger.error(f"❌ 后台 PDF 处理失败: {e}")
+        
+        # 只在有 PDF 处理器时启动后台线程
+        if self.pdf_processor:
+            thread = threading.Thread(target=process_pdfs_background, daemon=True)
+            thread.start()
+            logger.info("⏳ PDF 处理将在后台进行（不阻塞启动）")
+    
+    def _load_pdf_files(self, background: bool = False):
+        """加载 PDF 文件（按页切分存储，多线程并行）"""
         if not self.pdf_processor:
-            logger.warning("PDF 处理器不可用，跳过 PDF 文件")
+            if not background:
+                logger.warning("PDF 处理器不可用，跳过 PDF 文件")
             return
         
         kb_base = Path(os.environ.get("KB_BASE_DIR", Path(__file__).parent))
@@ -339,6 +363,9 @@ class KnowledgeBaseService:
             (Path(os.environ.get("KB_CHIPS_DIR", kb_base / "chips")), "chip_datasheet"),
             (Path(os.environ.get("KB_PRACTICES_DIR", kb_base / "best_practices")), "doc_pdf")
         ]
+        
+        total_pdfs = 0
+        total_pages = 0
         
         for dir_path, doc_type in pdf_dirs:
             if not dir_path.exists():
@@ -348,27 +375,37 @@ class KnowledgeBaseService:
             if not pdf_files:
                 continue
             
-            logger.info(f"发现 {len(pdf_files)} 个 PDF 文件 in {dir_path}")
+            total_pdfs += len(pdf_files)
+            prefix = "[后台]" if background else ""
+            logger.info(f"{prefix} 发现 {len(pdf_files)} 个 PDF 文件 in {dir_path}")
             
             for pdf_file in pdf_files:
                 try:
-                    logger.info(f"处理 PDF: {pdf_file.name}")
+                    logger.info(f"{prefix} 处理 PDF: {pdf_file.name}")
                     
                     # 从文件名提取元数据
                     from knowledge_base.pdf_processor import PDFMetadata
                     metadata = self.pdf_processor.extract_metadata_from_filename(pdf_file.name)
                     
-                    # 处理并存储
+                    # 处理并存储（启用多线程并行）
                     stats = self.pdf_processor.process_and_store(
                         pdf_file, 
                         self.vector_store,
-                        metadata=metadata
+                        metadata=metadata,
+                        use_parallel=True  # 多线程并行处理
                     )
                     
-                    logger.info(f"PDF {pdf_file.name}: 存储 {stats['pages_stored']}/{stats['pages_processed']} 页")
+                    total_pages += stats['pages_stored']
+                    mode_str = stats.get('mode', 'unknown')
+                    logger.info(f"{prefix} PDF {pdf_file.name}: 存储 {stats['pages_stored']}/{stats['pages_processed']} 页 "
+                               f"(模式: {mode_str})")
                     
                 except Exception as e:
                     logger.error(f"PDF 处理失败 {pdf_file}: {e}")
+        
+        if total_pdfs > 0:
+            prefix = "[后台]" if background else ""
+            logger.info(f"{prefix} PDF 处理汇总: {total_pdfs} 个文件, {total_pages} 页已存储")
     
     def _load_local_knowledge(self):
         """加载本地知识库（Markdown + PDF）"""

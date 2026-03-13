@@ -341,12 +341,18 @@ class GitHubRepoWatcher:
             logger.error(f"❌ 下载失败 {file_path}: {e}")
             return False
     
-    def _process_pdf_directly(self, pdf_path: Path, original_path: str) -> bool:
+    def _process_pdf_directly(self, pdf_path: Path, original_path: str, 
+                              is_update: bool = False) -> bool:
         """
         直接处理 PDF 文件（按页切分、生成 embedding、存储到 ChromaDB）
         
         这是方案 A：不再转换为 Markdown，而是直接解析 PDF 并存储向量
         支持大文件分批处理和进度日志
+        
+        Args:
+            pdf_path: PDF 文件路径
+            original_path: 原始文件路径（用于元数据）
+            is_update: 是否是更新（True 会先删除旧向量）
         """
         try:
             # 延迟导入，避免循环依赖
@@ -360,6 +366,15 @@ class GitHubRepoWatcher:
             vector_store = ChromaVectorStore()
             processor = PDFProcessor(embedder=embedder, max_workers=2)
             
+            # 如果是更新，先删除旧向量
+            if is_update:
+                logger.info(f"   🗑️  检测到更新，清理旧向量: {original_path}")
+                try:
+                    deleted = vector_store.delete_by_source(original_path)
+                    logger.info(f"   ✅ 已清理旧向量")
+                except Exception as e:
+                    logger.warning(f"   ⚠️ 清理旧向量失败: {e}")
+            
             # 从文件名提取元数据
             metadata = processor.extract_metadata_from_filename(pdf_path.name)
             # 添加原始路径信息
@@ -371,16 +386,18 @@ class GitHubRepoWatcher:
                     percent = current / total * 100
                     logger.info(f"   ⏳ {stage}: {current}/{total} ({percent:.1f}%)")
             
-            # 处理并存储（带进度回调）
+            # 处理并存储（多线程并行 + 进度回调）
             stats = processor.process_and_store(
                 pdf_path,
                 vector_store,
                 metadata=metadata,
-                progress_callback=progress_callback
+                progress_callback=progress_callback,
+                use_parallel=True  # 启用多线程并行处理
             )
             
             if stats['pages_stored'] > 0:
-                logger.info(f"   ✅ PDF 处理完成: {stats['pages_stored']}/{stats['pages_processed']} 页已存储")
+                action = "更新" if is_update else "新增"
+                logger.info(f"   ✅ PDF {action}完成: {stats['pages_stored']}/{stats['pages_processed']} 页已存储")
                 if stats['batches'] > 1:
                     logger.info(f"   📦 共分 {stats['batches']} 批处理")
                 return True
@@ -472,22 +489,45 @@ class GitHubRepoWatcher:
             file_name = Path(file_path).name
             
             # 检查是否需要更新
+            ext = Path(file_path).suffix.lower()
+            is_pdf = (ext == '.pdf')
+            is_update = file_path in sync_state
+            
             if not force and file_sha == sync_state.get(file_path):
-                # SHA 匹配，检查本地文件是否真的存在
-                target_name = Path(file_path).stem + ".md"
-                if "chip" in file_path.lower() or "芯片" in file_path:
-                    local_path = KB_CHIPS_DIR / target_name
+                # SHA 匹配
+                if is_pdf:
+                    # PDF：检查向量库中是否已存在
+                    from knowledge_base.kb_service import ChromaVectorStore
+                    try:
+                        vs = ChromaVectorStore()
+                        existing = vs.collection.get(
+                            where={"source": file_path},
+                            limit=1
+                        )
+                        if existing['ids']:
+                            logger.info(f"  [{i}/{len(files)}] ⏭️  跳过（PDF 已同步）: {file_path}")
+                            stats['skipped'] += 1
+                            stats['details'].append({'file': file_path, 'status': 'skipped', 'type': 'pdf'})
+                            continue
+                        else:
+                            logger.info(f"  [{i}/{len(files)}] 📝 重新处理（向量缺失）: {file_path}")
+                    except Exception:
+                        logger.info(f"  [{i}/{len(files)}] 📝 重新处理（无法验证向量）: {file_path}")
                 else:
-                    local_path = KB_PRACTICES_DIR / target_name
-                
-                if local_path.exists():
-                    logger.info(f"  [{i}/{len(files)}] ⏭️  跳过（已同步）: {file_path}")
-                    stats['skipped'] += 1
-                    stats['details'].append({'file': file_path, 'status': 'skipped'})
-                    continue
-                else:
-                    # SHA 匹配但文件不存在，可能是被删除了，重新下载
-                    logger.info(f"  [{i}/{len(files)}] 📝 重新下载（本地缺失）: {file_path}")
+                    # Markdown：检查本地文件
+                    target_name = Path(file_path).stem + ".md"
+                    if "chip" in file_path.lower() or "芯片" in file_path:
+                        local_path = KB_CHIPS_DIR / target_name
+                    else:
+                        local_path = KB_PRACTICES_DIR / target_name
+                    
+                    if local_path.exists():
+                        logger.info(f"  [{i}/{len(files)}] ⏭️  跳过（已同步）: {file_path}")
+                        stats['skipped'] += 1
+                        stats['details'].append({'file': file_path, 'status': 'skipped'})
+                        continue
+                    else:
+                        logger.info(f"  [{i}/{len(files)}] 📝 重新下载（本地缺失）: {file_path}")
             
             status_icon = "🆕" if file_path not in sync_state else "📝"
             logger.info(f"  [{i}/{len(files)}] {status_icon} 处理中: {file_path}")
@@ -506,10 +546,11 @@ class GitHubRepoWatcher:
             
             if ext == '.pdf':
                 # PDF 直接按页处理（方案A）
-                if self._process_pdf_directly(temp_file, file_path):
+                if self._process_pdf_directly(temp_file, file_path, is_update=is_update):
                     sync_state[file_path] = file_sha
                     stats['success'] += 1
-                    stats['details'].append({'file': file_path, 'status': 'success', 'type': 'pdf_pages'})
+                    action_type = 'pdf_update' if is_update else 'pdf_new'
+                    stats['details'].append({'file': file_path, 'status': 'success', 'type': action_type})
                 else:
                     logger.error(f"       ❌ PDF 处理失败: {file_path}")
                     stats['failed'] += 1

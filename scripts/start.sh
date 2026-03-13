@@ -275,6 +275,12 @@ show_kb_status() {
             echo "    KB_CHROMA_DIR: ${KB_CHROMA_DIR:-'(使用默认: ./knowledge_base/chroma_db)'}"
             echo "    KB_CHIPS_DIR: ${KB_CHIPS_DIR:-'(使用默认: ./knowledge_base/chips)'}"
             echo "    KB_PRACTICES_DIR: ${KB_PRACTICES_DIR:-'(使用默认: ./knowledge_base/best_practices)'}"
+            # 计算默认线程数（与 pdf_processor.py 逻辑一致）
+            CPU_COUNT=$(nproc 2>/dev/null || echo 4)
+            DEFAULT_PDF_WORKERS=$((CPU_COUNT / 3))
+            [ $DEFAULT_PDF_WORKERS -lt 4 ] && DEFAULT_PDF_WORKERS=4
+            echo "    KB_PDF_WORKERS: ${KB_PDF_WORKERS:-"(使用默认: $DEFAULT_PDF_WORKERS, CPU: $CPU_COUNT 核)"}"
+            echo "    KB_PDF_PARALLEL_THRESHOLD: ${KB_PDF_PARALLEL_THRESHOLD:-'(使用默认: 3页)'}"
             # 根据模型显示预期维度
             case "${KB_EMBEDDING_MODEL:-nomic-embed-text}" in
                 nomic-embed-text*) echo "    向量维度: 768 (预期)" ;;
