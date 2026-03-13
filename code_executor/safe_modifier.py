@@ -2,11 +2,17 @@
 """
 安全代码修改器
 使用 SEARCH/REPLACE 格式精确修改代码，避免误删
+
+增强功能：
+- 模糊匹配：支持一定程度的空白字符差异
+- 相似度匹配：使用 difflib 找到最佳匹配
+- 多重回退策略：精确 → 规范化 → 相似度 → 失败
 """
 
 import re
 import logging
-from typing import Optional
+import difflib
+from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +83,189 @@ class SafeCodeModifier:
         logger.warning(f"没有代码生成器，无法修改: {file_path}")
         return file_content
     
+    def _fuzzy_search_replace(
+        self,
+        file_content: str,
+        search_text: str,
+        replace_text: str,
+        threshold: float = 0.85
+    ) -> Tuple[str, str]:
+        """
+        模糊搜索替换
+        
+        策略（按优先级）：
+        1. 精确匹配
+        2. 规范化匹配（忽略行尾空白和换行符差异）
+        3. 相似度匹配（使用 difflib.SequenceMatcher）
+        
+        Args:
+            file_content: 原始文件内容
+            search_text: AI 生成的 SEARCH 文本
+            replace_text: AI 生成的 REPLACE 文本
+            threshold: 相似度阈值（0-1）
+            
+        Returns:
+            (new_content, match_method)
+            - new_content: 替换后的内容
+            - match_method: 使用的匹配方法（"exact", "normalized", "fuzzy"）
+            
+        Raises:
+            ValueError: 所有匹配方法都失败
+        """
+        logger.debug(f"[SafeModifier] 开始模糊匹配")
+        logger.debug(f"[SafeModifier] SEARCH 文本 ({len(search_text)} 字符, {search_text.count(chr(10))+1} 行):")
+        logger.debug(f"[SafeModifier]   {search_text[:200]}{'...' if len(search_text) > 200 else ''}")
+        logger.debug(f"[SafeModifier] REPLACE 文本 ({len(replace_text)} 字符, {replace_text.count(chr(10))+1} 行):")
+        logger.debug(f"[SafeModifier]   {replace_text[:200]}{'...' if len(replace_text) > 200 else ''}")
+        logger.debug(f"[SafeModifier] 文件内容 ({len(file_content)} 字符)")
+        
+        # 1. 精确匹配
+        logger.debug(f"[SafeModifier] 尝试精确匹配...")
+        if search_text in file_content:
+            new_content = file_content.replace(search_text, replace_text, 1)
+            logger.debug(f"[SafeModifier] ✅ 精确匹配成功")
+            return new_content, "exact"
+        
+        logger.debug(f"[SafeModifier] 精确匹配失败，尝试规范化匹配...")
+        logger.debug(f"[SafeModifier]   SEARCH MD5: {hash(search_text) % 10000}")
+        logger.debug(f"[SafeModifier]   内容 MD5: {hash(file_content[:len(search_text)]) % 10000}")
+        
+        # 2. 规范化匹配（忽略行尾空白）
+        def normalize(text):
+            lines = text.split('\n')
+            lines = [rstrip(line) for line in lines]
+            return '\n'.join(lines)
+        
+        def rstrip(line):
+            # 安全地移除行尾空白
+            return line.rstrip()
+        
+        normalized_search = normalize(search_text)
+        normalized_content = normalize(file_content)
+        
+        if normalized_search in normalized_content:
+            # 找到在规范化内容中的位置
+            idx = normalized_content.find(normalized_search)
+            # 映射回原始内容
+            # 简单方法：在原始内容中找相似区域
+            new_content = self._apply_normalized_replace(
+                file_content, search_text, replace_text
+            )
+            if new_content != file_content:
+                return new_content, "normalized"
+        
+        logger.debug(f"[SafeModifier] 规范化匹配失败，尝试相似度匹配...")
+        logger.debug(f"[SafeModifier] 相似度阈值: {threshold}")
+        
+        # 3. 相似度匹配（基于行）
+        best_match = self._find_best_line_match(
+            file_content, search_text, threshold
+        )
+        
+        if best_match:
+            actual_text, confidence = best_match
+            logger.info(f"[SafeModifier] 找到模糊匹配 (置信度: {confidence:.2f})")
+            logger.debug(f"[SafeModifier]   期望 ({len(search_text)} 字符):")
+            for i, line in enumerate(search_text.split('\n')[:5], 1):
+                logger.debug(f"[SafeModifier]     {i}: {line[:80]}")
+            logger.debug(f"[SafeModifier]   实际 ({len(actual_text)} 字符):")
+            for i, line in enumerate(actual_text.split('\n')[:5], 1):
+                logger.debug(f"[SafeModifier]     {i}: {line[:80]}")
+            
+            new_content = file_content.replace(actual_text, replace_text, 1)
+            return new_content, f"fuzzy({confidence:.2f})"
+        
+        # 所有方法都失败
+        logger.error(f"[SafeModifier] ❌ 所有匹配方法都失败")
+        logger.error(f"[SafeModifier]   SEARCH ({len(search_text)} 字符):")
+        logger.error(f"     {search_text[:300]}{'...' if len(search_text) > 300 else ''}")
+        logger.error(f"[SafeModifier]   文件内容前 500 字符:")
+        logger.error(f"     {file_content[:500]}{'...' if len(file_content) > 500 else ''}")
+        raise ValueError(
+            f"无法找到匹配的文本（尝试了精确、规范化、相似度匹配）"
+        )
+    
+    def _apply_normalized_replace(
+        self,
+        file_content: str,
+        search_text: str,
+        replace_text: str
+    ) -> str:
+        """
+        应用规范化替换
+        
+        策略：基于行内容匹配
+        """
+        file_lines = file_content.split('\n')
+        search_lines = search_text.split('\n')
+        
+        # 移除空行进行比较
+        search_lines_stripped = [l.strip() for l in search_lines if l.strip()]
+        
+        if not search_lines_stripped:
+            return file_content
+        
+        # 查找匹配的起始行
+        for i in range(len(file_lines) - len(search_lines) + 1):
+            window = file_lines[i:i + len(search_lines)]
+            window_stripped = [l.strip() for l in window if l.strip()]
+            
+            if len(window_stripped) != len(search_lines_stripped):
+                continue
+            
+            # 比较非空行
+            match = all(
+                w == s for w, s in zip(window_stripped, search_lines_stripped)
+            )
+            
+            if match:
+                # 替换这一区域
+                original_block = '\n'.join(file_lines[i:i + len(search_lines)])
+                new_content = file_content.replace(original_block, replace_text, 1)
+                return new_content
+        
+        return file_content
+    
+    def _find_best_line_match(
+        self,
+        file_content: str,
+        search_text: str,
+        threshold: float
+    ) -> Optional[Tuple[str, float]]:
+        """
+        使用 difflib 找到最佳匹配
+        
+        基于行的相似度比较
+        """
+        search_lines = search_text.split('\n')
+        num_search_lines = len(search_lines)
+        
+        if num_search_lines == 0:
+            return None
+        
+        file_lines = file_content.split('\n')
+        best_match = None
+        best_ratio = 0.0
+        
+        # 滑动窗口查找最佳匹配
+        for i in range(len(file_lines) - num_search_lines + 1):
+            window = file_lines[i:i + num_search_lines]
+            window_text = '\n'.join(window)
+            
+            # 计算相似度
+            ratio = difflib.SequenceMatcher(
+                None, search_text, window_text
+            ).ratio()
+            
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_match = window_text
+        
+        if best_match and best_ratio >= threshold:
+            return (best_match, best_ratio)
+        
+        return None
+    
     def _ai_assisted_replace(
         self,
         file_path: str,
@@ -84,7 +273,7 @@ class SafeCodeModifier:
         instruction: str
     ) -> str:
         """
-        AI 辅助的精确替换
+        AI 辅助的精确替换（增强版，支持模糊匹配）
         
         让 AI 生成 SEARCH/REPLACE 格式，然后执行替换
         """
@@ -147,25 +336,30 @@ REPLACE:
             logger.error("AI 没有提供有效的 SEARCH/REPLACE 格式")
             raise ValueError("AI 没有提供有效的 SEARCH/REPLACE 格式")
         
-        search_text = search_match.group(1).strip()
-        replace_text = replace_match.group(1).strip()
+        search_text = search_match.group(1).rstrip('\n')
+        replace_text = replace_match.group(1).rstrip('\n')
         
-        # 执行替换
-        if search_text in file_content:
-            new_content = file_content.replace(search_text, replace_text, 1)
+        # 使用模糊匹配执行替换
+        try:
+            new_content, match_method = self._fuzzy_search_replace(
+                file_content, search_text, replace_text
+            )
+            
             # 验证是否真的修改了
             if new_content == file_content:
                 logger.warning(f"⚠️  替换后内容未变化，SEARCH 和 REPLACE 可能相同: {file_path}")
                 raise ValueError("SEARCH 和 REPLACE 内容相同，没有实际修改")
-            logger.info(f"✅ 精确替换成功: {file_path} ({len(search_text)} → {len(replace_text)} 字符)")
+            
+            logger.info(f"✅ 替换成功 [{match_method}]: {file_path} ({len(search_text)} → {len(replace_text)} 字符)")
             return new_content
-        else:
-            logger.error(f"❌ SEARCH 文本未找到: {file_path}")
+            
+        except ValueError as e:
+            logger.error(f"❌ 替换失败: {file_path} - {e}")
             logger.debug(f"SEARCH 文本 ({len(search_text)} 字符):")
             logger.debug(search_text[:200])
-            logger.debug(f"文件内容 ({len(file_content)} 字符):")
+            logger.debug(f"文件内容前200字符:")
             logger.debug(file_content[:200])
-            raise ValueError(f"无法在文件中找到要替换的文本: {search_text[:50]}...")
+            raise
     
     def _chunked_modify(
         self,
