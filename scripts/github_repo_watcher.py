@@ -36,10 +36,14 @@ import logging
 # 添加项目路径
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+# 日志配置（如果作为主程序运行）
+if __name__ == "__main__":
+    log_level = os.environ.get('LOG_LEVEL', 'INFO').upper()
+    logging.basicConfig(
+        level=getattr(logging, log_level),
+        format='%(asctime)s [%(name)s] %(levelname)s: %(message)s',
+        datefmt='%H:%M:%S'
+    )
 logger = logging.getLogger(__name__)
 
 # 默认配置

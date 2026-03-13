@@ -45,6 +45,11 @@ HOST="${GITHUB_AGENT_HOST:-0.0.0.0}"
 PORT="${GITHUB_AGENT_PORT:-8080}"
 LOG_LEVEL="${LOG_LEVEL:-INFO}"
 
+# 检查是否为 DEBUG 模式
+is_debug() {
+    [[ "$LOG_LEVEL" == "DEBUG" ]]
+}
+
 # 打印信息
 info() {
     echo "${BLUE}[INFO]${NC} $1"
@@ -62,9 +67,19 @@ error() {
     echo "${RED}[✗]${NC} $1"
 }
 
+# DEBUG 输出
+debug() {
+    if is_debug; then
+        echo "${MAGENTA}[DEBUG]${NC} $1"
+    fi
+}
+
 step() {
     echo ""
     echo "${CYAN}${BOLD}▶ $1${NC}"
+    if is_debug; then
+        echo "${MAGENTA}────────────────────────────────────────────────────────${NC}"
+    fi
 }
 
 # 显示 Banner

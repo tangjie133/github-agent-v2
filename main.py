@@ -75,11 +75,49 @@ def log_banner():
     print(f"{COLORS['MAGENTA']}{COLORS['BOLD']}╚══════════════════════════════════════════════════════════════╝{COLORS['RESET']}")
     print()
 
-# Setup logging - 简化第三方库的日志输出
+# 读取日志级别
+LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO').upper()
+
+# 定义颜色代码
+COLORS_LOG = {
+    'DEBUG': '\033[0;35m',     # 紫色
+    'INFO': '\033[0;34m',      # 蓝色
+    'WARNING': '\033[0;33m',   # 黄色
+    'ERROR': '\033[0;31m',     # 红色
+    'CRITICAL': '\033[1;31m',  # 粗红
+    'RESET': '\033[0m',
+    'BOLD': '\033[1m',
+}
+
+class ColoredFormatter(logging.Formatter):
+    """带颜色的日志格式化器"""
+    def format(self, record):
+        # 简化模块名
+        module_name = record.name.replace('knowledge_base.', 'KB.').replace('code_executor.', 'CE.')
+        
+        # 根据级别选择颜色
+        color = COLORS_LOG.get(record.levelname, COLORS_LOG['RESET'])
+        reset = COLORS_LOG['RESET']
+        bold = COLORS_LOG['BOLD']
+        
+        # 格式化时间
+        time_str = self.formatTime(record, '%H:%M:%S')
+        
+        # 格式化消息
+        if LOG_LEVEL == 'DEBUG':
+            # DEBUG 模式显示详细信息
+            return f"{time_str} {color}{bold}[{record.levelname:8}]{reset} {color}[{module_name:15}]{reset} {record.getMessage()}"
+        else:
+            # INFO 模式简化输出
+            level_icon = {'INFO': '•', 'WARNING': '!', 'ERROR': '✗', 'DEBUG': '◆'}.get(record.levelname, '•')
+            return f"{color}{level_icon}{reset} {record.getMessage()}"
+
+# 配置日志
+handler = logging.StreamHandler()
+handler.setFormatter(ColoredFormatter())
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(name)s] %(levelname)s: %(message)s',
-    datefmt='%H:%M:%S'
+    level=getattr(logging, LOG_LEVEL),
+    handlers=[handler]
 )
 logger = logging.getLogger(__name__)
 
