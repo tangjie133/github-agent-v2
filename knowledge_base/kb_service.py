@@ -10,7 +10,7 @@ import sys
 import json
 import logging
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 
@@ -282,6 +282,15 @@ class KnowledgeBaseService:
             distance_fn="cosine"
         )
         
+        # 初始化 PDF 处理器
+        try:
+            from knowledge_base.pdf_processor import PDFProcessor
+            self.pdf_processor = PDFProcessor(embedder=self.embedder)
+            logger.info("PDF 处理器已初始化")
+        except ImportError as e:
+            logger.warning(f"PDF 处理器初始化失败: {e}")
+            self.pdf_processor = None
+        
         logger.info(f"使用嵌入模型: {self.embedding_model} @ {self.embedding_host}")
         
         # DEBUG 模式下输出详细配置
@@ -305,48 +314,88 @@ class KnowledgeBaseService:
         
         logger.info(f"知识库服务初始化完成，数据目录: {self.data_dir}")
     
-    def _load_local_knowledge(self):
-        """加载本地知识库"""
-        kb_base = Path(__file__).parent
+    def _get_kb_dirs(self) -> List[Tuple[Path, str]]:
+        """获取知识库目录配置（支持环境变量）"""
+        kb_base = Path(os.environ.get("KB_BASE_DIR", Path(__file__).parent))
+        chips_dir = Path(os.environ.get("KB_CHIPS_DIR", kb_base / "chips"))
+        practices_dir = Path(os.environ.get("KB_PRACTICES_DIR", kb_base / "best_practices"))
         
-        # 加载芯片文档
-        chips_dir = kb_base / "chips"
+        dirs = []
         if chips_dir.exists():
-            for file in chips_dir.glob("*.md"):
+            dirs.append((chips_dir, "chip_doc"))
+        if practices_dir.exists():
+            dirs.append((practices_dir, "best_practice"))
+        
+        return dirs
+    
+    def _load_pdf_files(self):
+        """加载 PDF 文件（按页切分存储）"""
+        if not self.pdf_processor:
+            logger.warning("PDF 处理器不可用，跳过 PDF 文件")
+            return
+        
+        kb_base = Path(os.environ.get("KB_BASE_DIR", Path(__file__).parent))
+        pdf_dirs = [
+            (Path(os.environ.get("KB_CHIPS_DIR", kb_base / "chips")), "chip_datasheet"),
+            (Path(os.environ.get("KB_PRACTICES_DIR", kb_base / "best_practices")), "doc_pdf")
+        ]
+        
+        for dir_path, doc_type in pdf_dirs:
+            if not dir_path.exists():
+                continue
+            
+            pdf_files = list(dir_path.glob("*.pdf"))
+            if not pdf_files:
+                continue
+            
+            logger.info(f"发现 {len(pdf_files)} 个 PDF 文件 in {dir_path}")
+            
+            for pdf_file in pdf_files:
+                try:
+                    logger.info(f"处理 PDF: {pdf_file.name}")
+                    
+                    # 从文件名提取元数据
+                    from knowledge_base.pdf_processor import PDFMetadata
+                    metadata = self.pdf_processor.extract_metadata_from_filename(pdf_file.name)
+                    
+                    # 处理并存储
+                    stats = self.pdf_processor.process_and_store(
+                        pdf_file, 
+                        self.vector_store,
+                        metadata=metadata
+                    )
+                    
+                    logger.info(f"PDF {pdf_file.name}: 存储 {stats['pages_stored']}/{stats['pages_processed']} 页")
+                    
+                except Exception as e:
+                    logger.error(f"PDF 处理失败 {pdf_file}: {e}")
+    
+    def _load_local_knowledge(self):
+        """加载本地知识库（Markdown + PDF）"""
+        # 1. 加载 Markdown 文件
+        kb_dirs = self._get_kb_dirs()
+        
+        for dir_path, doc_type in kb_dirs:
+            type_name = "芯片文档" if doc_type == "chip_doc" else "最佳实践"
+            for file in dir_path.glob("*.md"):
                 try:
                     content = file.read_text(encoding='utf-8')
                     embedding = self.embedder.embed(content[:1000])  # 限制长度
                     self.vector_store.add_with_embedding(
                         content,
                         embedding,
-                        {"source": str(file), "type": "chip_doc"}
+                        {"source": str(file), "type": doc_type}
                     )
-                    logger.info(f"加载芯片文档: {file.name}")
+                    logger.info(f"加载{type_name}: {file.name}")
                 except Exception as e:
                     logger.warning(f"加载文档失败 {file}: {e}")
         
-        # 加载最佳实践
-        practices_dir = kb_base / "best_practices"
-        if practices_dir.exists():
-            for file in practices_dir.glob("*.md"):
-                try:
-                    content = file.read_text(encoding='utf-8')
-                    embedding = self.embedder.embed(content[:1000])
-                    self.vector_store.add_with_embedding(
-                        content,
-                        embedding,
-                        {"source": str(file), "type": "best_practice"}
-                    )
-                    logger.info(f"加载最佳实践: {file.name}")
-                except Exception as e:
-                    logger.warning(f"加载文档失败 {file}: {e}")
+        # 2. 加载 PDF 文件（按页切分）
+        self._load_pdf_files()
         
         # 获取文档数量
-        if hasattr(self.vector_store, 'get_stats'):
-            doc_count = self.vector_store.get_stats().get("total_documents", 0)
-        else:
-            doc_count = len(getattr(self.vector_store, 'documents', []))
-        logger.info(f"共加载 {doc_count} 个文档")
+        doc_count = self.vector_store.get_stats().get("total_documents", 0)
+        logger.info(f"共加载 {doc_count} 个文档片段")
     
     def reload(self):
         """重新加载知识库（增量更新）"""
@@ -364,17 +413,13 @@ class KnowledgeBaseService:
         """增量加载：只处理新增或修改的文件"""
         import hashlib
         
-        kb_base = Path(__file__).parent
         stats = {"added": 0, "updated": 0, "unchanged": 0, "failed": 0}
         
         # 获取已存储的文件哈希
         stored_hashes = self.vector_store.get_document_hashes()
         
-        # 扫描所有文件
-        all_dirs = [
-            (kb_base / "chips", "chip_doc"),
-            (kb_base / "best_practices", "best_practice")
-        ]
+        # 扫描所有文件（支持环境变量配置路径）
+        all_dirs = self._get_kb_dirs()
         
         for dir_path, doc_type in all_dirs:
             if not dir_path.exists():

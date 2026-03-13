@@ -273,6 +273,8 @@ show_kb_status() {
             echo "    KB_EMBEDDING_HOST: ${KB_EMBEDDING_HOST:-'(使用默认: http://localhost:11434)'}"
             echo "    KB_DATA_DIR: ${KB_DATA_DIR:-'(使用默认: ./knowledge_base/data)'}"
             echo "    KB_CHROMA_DIR: ${KB_CHROMA_DIR:-'(使用默认: ./knowledge_base/chroma_db)'}"
+            echo "    KB_CHIPS_DIR: ${KB_CHIPS_DIR:-'(使用默认: ./knowledge_base/chips)'}"
+            echo "    KB_PRACTICES_DIR: ${KB_PRACTICES_DIR:-'(使用默认: ./knowledge_base/best_practices)'}"
             # 根据模型显示预期维度
             case "${KB_EMBEDDING_MODEL:-nomic-embed-text}" in
                 nomic-embed-text*) echo "    向量维度: 768 (预期)" ;;

@@ -22,6 +22,12 @@ pathlib>=1.0.1
 chromadb>=0.5.0  # 向量数据库，内置 HNSW 和持久化
 numpy>=1.24.0
 
+# PDF 处理
+PyPDF2>=3.0.0           # PDF 文本提取
+pdfplumber>=0.10.0      # 更精准的 PDF 解析（表格、布局）
+python-magic>=0.4.27    # 文件类型检测
+langchain-text-splitters>=0.0.1  # 文本切分（可选，语义切分）
+
 # Phase 4: Code Executor
 # 使用本地 Ollama，无需额外依赖
 

@@ -49,14 +49,14 @@ logger = logging.getLogger(__name__)
 # 默认配置
 DEFAULT_REPO = "tangjie133/knowledge-base"
 DEFAULT_BRANCH = "main"
-KB_CHIPS_DIR = Path(__file__).parent.parent / "knowledge_base" / "chips"
-KB_PRACTICES_DIR = Path(__file__).parent.parent / "knowledge_base" / "best_practices"
+
+# 知识库目录配置（支持环境变量）
+KB_BASE_DIR = Path(os.environ.get("KB_BASE_DIR", Path(__file__).parent.parent / "knowledge_base"))
+KB_CHIPS_DIR = Path(os.environ.get("KB_CHIPS_DIR", KB_BASE_DIR / "chips"))
+KB_PRACTICES_DIR = Path(os.environ.get("KB_PRACTICES_DIR", KB_BASE_DIR / "best_practices"))
 
 # 支持的文件格式
 SUPPORTED_EXTS = {'.md', '.txt', '.pdf', '.docx'}
-
-# 基础目录
-KB_BASE_DIR = Path(__file__).parent.parent / "knowledge_base"
 
 # 同步状态文件路径（支持环境变量配置）
 _state_dir = os.environ.get("GITHUB_AGENT_STATEDIR")
@@ -341,8 +341,61 @@ class GitHubRepoWatcher:
             logger.error(f"❌ 下载失败 {file_path}: {e}")
             return False
     
+    def _process_pdf_directly(self, pdf_path: Path, original_path: str) -> bool:
+        """
+        直接处理 PDF 文件（按页切分、生成 embedding、存储到 ChromaDB）
+        
+        这是方案 A：不再转换为 Markdown，而是直接解析 PDF 并存储向量
+        支持大文件分批处理和进度日志
+        """
+        try:
+            # 延迟导入，避免循环依赖
+            from knowledge_base.pdf_processor import PDFProcessor, PDFMetadata
+            from knowledge_base.kb_service import SimpleEmbedding, ChromaVectorStore
+            
+            logger.info(f"📄 直接处理 PDF: {pdf_path.name}")
+            
+            # 初始化组件
+            embedder = SimpleEmbedding()
+            vector_store = ChromaVectorStore()
+            processor = PDFProcessor(embedder=embedder, max_workers=2)
+            
+            # 从文件名提取元数据
+            metadata = processor.extract_metadata_from_filename(pdf_path.name)
+            # 添加原始路径信息
+            metadata.source = original_path
+            
+            # 定义进度回调
+            def progress_callback(current, total, stage):
+                if total > 0:
+                    percent = current / total * 100
+                    logger.info(f"   ⏳ {stage}: {current}/{total} ({percent:.1f}%)")
+            
+            # 处理并存储（带进度回调）
+            stats = processor.process_and_store(
+                pdf_path,
+                vector_store,
+                metadata=metadata,
+                progress_callback=progress_callback
+            )
+            
+            if stats['pages_stored'] > 0:
+                logger.info(f"   ✅ PDF 处理完成: {stats['pages_stored']}/{stats['pages_processed']} 页已存储")
+                if stats['batches'] > 1:
+                    logger.info(f"   📦 共分 {stats['batches']} 批处理")
+                return True
+            else:
+                logger.warning(f"   ⚠️ PDF 未存储任何页面")
+                return False
+                
+        except Exception as e:
+            logger.error(f"   ❌ PDF 直接处理失败: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return False
+    
     def convert_to_markdown(self, input_path: Path, output_path: Path) -> bool:
-        """将文件转换为 Markdown"""
+        """将文件转换为 Markdown（仅用于非 PDF 文件）"""
         ext = input_path.suffix.lower()
         
         try:
@@ -355,18 +408,6 @@ class GitHubRepoWatcher:
                 # 文本文件包装为 Markdown
                 content = input_path.read_text(encoding='utf-8')
                 md_content = f"# {input_path.stem}\n\n```\n{content}\n```\n"
-                output_path.write_text(md_content, encoding='utf-8')
-                
-            elif ext == '.pdf':
-                # PDF 提取文本
-                result = subprocess.run(
-                    ["pdftotext", "-layout", str(input_path), "-"],
-                    capture_output=True,
-                    text=True,
-                    timeout=30
-                )
-                content = result.stdout
-                md_content = f"# {input_path.stem}\n\n## 内容\n\n{content}\n"
                 output_path.write_text(md_content, encoding='utf-8')
                 
             elif ext == '.docx':
@@ -452,13 +493,7 @@ class GitHubRepoWatcher:
             logger.info(f"  [{i}/{len(files)}] {status_icon} 处理中: {file_path}")
             
             # 确定目标目录
-            path_lower = file_path.lower()
-            if any(keyword in path_lower for keyword in ["chip", "芯片", "hardware", "datasheet"]):
-                target_dir = KB_CHIPS_DIR
-            else:
-                target_dir = KB_PRACTICES_DIR
-            
-            # 下载文件
+            # 下载文件到临时目录
             temp_file = temp_dir / Path(file_path).name
             if not self.download_file(file_path, temp_file):
                 logger.error(f"       ❌ 下载失败: {file_path}")
@@ -466,18 +501,38 @@ class GitHubRepoWatcher:
                 stats['details'].append({'file': file_path, 'status': 'failed', 'reason': 'download'})
                 continue
             
-            # 转换为目标 Markdown
-            target_name = Path(file_path).stem + ".md"
-            target_path = target_dir / target_name
+            # 根据文件类型处理
+            ext = Path(file_path).suffix.lower()
             
-            if self.convert_to_markdown(temp_file, target_path):
-                sync_state[file_path] = file_sha
-                stats['success'] += 1
-                stats['details'].append({'file': file_path, 'status': 'success'})
+            if ext == '.pdf':
+                # PDF 直接按页处理（方案A）
+                if self._process_pdf_directly(temp_file, file_path):
+                    sync_state[file_path] = file_sha
+                    stats['success'] += 1
+                    stats['details'].append({'file': file_path, 'status': 'success', 'type': 'pdf_pages'})
+                else:
+                    logger.error(f"       ❌ PDF 处理失败: {file_path}")
+                    stats['failed'] += 1
+                    stats['details'].append({'file': file_path, 'status': 'failed', 'reason': 'pdf_process'})
             else:
-                logger.error(f"       ❌ 转换失败: {file_path}")
-                stats['failed'] += 1
-                stats['details'].append({'file': file_path, 'status': 'failed', 'reason': 'convert'})
+                # 其他文件（Markdown/TXT）转换为 Markdown 保存
+                path_lower = file_path.lower()
+                if any(keyword in path_lower for keyword in ["chip", "芯片", "hardware", "datasheet"]):
+                    target_dir = KB_CHIPS_DIR
+                else:
+                    target_dir = KB_PRACTICES_DIR
+                
+                target_name = Path(file_path).stem + ".md"
+                target_path = target_dir / target_name
+                
+                if self.convert_to_markdown(temp_file, target_path):
+                    sync_state[file_path] = file_sha
+                    stats['success'] += 1
+                    stats['details'].append({'file': file_path, 'status': 'success', 'type': 'markdown'})
+                else:
+                    logger.error(f"       ❌ 转换失败: {file_path}")
+                    stats['failed'] += 1
+                    stats['details'].append({'file': file_path, 'status': 'failed', 'reason': 'convert'})
             
             # 清理临时文件
             temp_file.unlink(missing_ok=True)
