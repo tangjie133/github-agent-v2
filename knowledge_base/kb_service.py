@@ -33,15 +33,50 @@ except ImportError:
 class SimpleEmbedding:
     """简化版嵌入生成器（使用 Ollama）"""
     
+    # 常用模型的向量维度
+    MODEL_DIMENSIONS = {
+        "nomic-embed-text": 768,
+        "nomic-embed-text:latest": 768,
+        "bge-m3": 1024,
+        "bge-m3:latest": 1024,
+        "bge-large": 1024,
+        "all-minilm": 384,
+        "all-minilm:latest": 384,
+        "mxbai-embed-large": 1024,
+    }
+    
     def __init__(self, model: str = "nomic-embed-text", host: str = "http://localhost:11434"):
         self.model = model
         self.host = host
         self._cache = {}  # 简单缓存
+        self._dimension = None  # 动态获取的维度
         
-    def embed(self, text: str) -> List[float]:
+    def _get_dimension(self) -> int:
+        """获取向量维度（优先从已知模型获取，否则动态检测）"""
+        if self._dimension is not None:
+            return self._dimension
+        
+        # 从已知模型列表查找
+        if self.model in self.MODEL_DIMENSIONS:
+            self._dimension = self.MODEL_DIMENSIONS[self.model]
+            return self._dimension
+        
+        # 尝试动态检测（调用一次嵌入服务）
+        try:
+            test_embedding = self.embed("test", use_cache=False)
+            self._dimension = len(test_embedding)
+            logger.info(f"检测到模型 '{self.model}' 的向量维度: {self._dimension}")
+            return self._dimension
+        except Exception:
+            # 默认使用768
+            logger.warning(f"无法检测模型 '{self.model}' 的维度，使用默认值 768")
+            self._dimension = 768
+            return 768
+        
+    def embed(self, text: str, use_cache: bool = True) -> List[float]:
         """生成文本嵌入向量"""
         # 检查缓存
-        if text in self._cache:
+        if use_cache and text in self._cache:
             return self._cache[text]
         
         try:
@@ -55,12 +90,13 @@ class SimpleEmbedding:
             embedding = response.json()["embedding"]
             
             # 缓存结果
-            self._cache[text] = embedding
+            if use_cache:
+                self._cache[text] = embedding
             return embedding
         except Exception as e:
             logger.error(f"嵌入生成失败: {e}")
-            # 返回零向量作为降级
-            return [0.0] * 768
+            # 返回零向量作为降级（使用正确的维度）
+            return [0.0] * self._get_dimension()
     
     def embed_batch(self, texts: List[str]) -> List[List[float]]:
         """批量生成嵌入"""
@@ -122,13 +158,35 @@ class SimpleVectorStore:
 class KnowledgeBaseService:
     """知识库服务"""
     
-    def __init__(self, data_dir: str = None):
+    def __init__(self, data_dir: str = None, embedding_model: str = None, embedding_host: str = None):
         self.data_dir = Path(data_dir or os.environ.get("KB_DATA_DIR", "./knowledge_base/data"))
         self.data_dir.mkdir(parents=True, exist_ok=True)
         
+        # 从环境变量或参数获取嵌入模型配置
+        self.embedding_model = embedding_model or os.environ.get("KB_EMBEDDING_MODEL", "nomic-embed-text")
+        self.embedding_host = embedding_host or os.environ.get("KB_EMBEDDING_HOST", "http://localhost:11434")
+        
         # 初始化组件
-        self.embedder = SimpleEmbedding()
+        self.embedder = SimpleEmbedding(model=self.embedding_model, host=self.embedding_host)
         self.vector_store = SimpleVectorStore()
+        
+        logger.info(f"使用嵌入模型: {self.embedding_model} @ {self.embedding_host}")
+        
+        # DEBUG 模式下输出详细配置
+        if logger.isEnabledFor(logging.DEBUG):
+            # 获取实际的向量维度
+            actual_dimension = self.embedder._get_dimension()
+            logger.debug(f"嵌入模型配置详情:")
+            logger.debug(f"  模型名称: {self.embedding_model}")
+            logger.debug(f"  服务地址: {self.embedding_host}")
+            logger.debug(f"  向量维度: {actual_dimension}")
+            logger.debug(f"  数据目录: {self.data_dir}")
+            # 测试嵌入服务是否可用
+            try:
+                test_embedding = self.embedder.embed("test")
+                logger.debug(f"  服务状态: 正常 (向量长度: {len(test_embedding)})")
+            except Exception as e:
+                logger.debug(f"  服务状态: 异常 ({e})")
         
         # 加载本地知识
         self._load_local_knowledge()

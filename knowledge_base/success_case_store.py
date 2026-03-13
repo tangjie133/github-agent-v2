@@ -563,8 +563,14 @@ class SuccessCaseStore:
             except Exception as e:
                 logger.error(f"[SuccessCaseStore] 生成 embedding 失败: {e}")
         
-        # 降级：返回零向量
-        return [0.0] * 768
+        # 降级：返回零向量（尝试获取正确维度，否则默认768）
+        default_dim = 768
+        if self.embedding_generator and hasattr(self.embedding_generator, '_get_dimension'):
+            try:
+                default_dim = self.embedding_generator._get_dimension()
+            except Exception:
+                pass
+        return [0.0] * default_dim
     
     def _cosine_similarity(self, vec1: List[float], vec2: List[float]) -> float:
         """计算余弦相似度"""

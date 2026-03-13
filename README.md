@@ -235,7 +235,17 @@ OLLAMA_TIMEOUT=300
 #### 知识库服务配置
 
 ```bash
+# 知识库服务连接地址（用于连接已有服务）
 KB_SERVICE_URL=http://localhost:8000
+
+# 知识库服务监听配置（用于启动服务）
+# KB_SERVICE_HOST=0.0.0.0
+# KB_SERVICE_PORT=8000
+
+# 嵌入模型配置（通过 Ollama，可选）
+# KB_EMBEDDING_MODEL=nomic-embed-text  # 可选: bge-m3, all-minilm 等
+# KB_EMBEDDING_HOST=http://localhost:11434
+
 KB_TIMEOUT=30
 ```
 
@@ -249,15 +259,63 @@ GITHUB_AGENT_STATEDIR=./state
 #### 日志配置
 
 ```bash
+# 日志级别: DEBUG, INFO, WARNING, ERROR
 LOG_LEVEL=INFO
+
+# 日志格式（可选，默认使用内置格式）
+# LOG_FORMAT=%(asctime)s - %(name)s - %(levelname)s - %(message)s
+
+# 日志文件路径（可选，默认输出到控制台）
 # LOG_FILE=/var/log/github-agent-v2/app.log
 ```
+
+**DEBUG 模式：**
+
+```bash
+# 启用详细调试输出
+export LOG_LEVEL=DEBUG
+./scripts/start.sh --port 8080
+```
+
+DEBUG 模式将显示：
+- 详细的环境检查信息
+- 所有配置变量的值
+- 知识库同步的详细过程
+- 各组件的初始化详情
 
 #### 安全配置
 
 ```bash
 MAX_FILE_SIZE=1048576              # 最大文件大小（字节）
 MAX_FILES_PER_PR=10                # 单次 PR 最大修改文件数
+
+# 允许修改的文件扩展名（可选，逗号分隔）
+# ALLOWED_FILE_EXTENSIONS=.py,.js,.ts,.json,.md,.yml,.yaml,.txt
+```
+
+#### 知识库同步配置
+
+```bash
+# 启用 GitHub 知识库同步
+KB_GITHUB_SYNC_ENABLED=true
+
+# 知识库仓库地址
+KB_REPO=tangjie133/knowledge-base
+KB_BRANCH=main
+
+# GitHub Token（用于 API 认证）
+GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxx
+
+# 自动同步间隔（秒），0 表示不同步
+KB_SYNC_INTERVAL=300
+
+# 启用 Webhook 实时同步
+KB_WEBHOOK_ENABLED=true
+KB_WEBHOOK_PORT=9000
+KB_WEBHOOK_SECRET=your_webhook_secret
+
+# 本地知识库路径（可选，默认 ./knowledge_base/data/cases）
+# KB_STORAGE_PATH=./knowledge_base/data/cases
 ```
 
 ---
@@ -423,6 +481,24 @@ knowledge_base/data/cases/
 
 **详细文档：** [knowledge_base/USAGE.md](./knowledge_base/USAGE.md)
 
+### 本地知识库路径
+
+同步后的知识库文件存储在以下位置：
+
+```
+knowledge_base/
+├── chips/              # 芯片数据手册（从 GitHub 同步）
+│   ├── SD3031.md
+│   └── DS3231.md
+├── best_practices/     # 最佳实践文档（从 GitHub 同步）
+│   └── guide.md
+└── data/               # 本地数据（自动创建）
+    ├── cases/          # 成功案例
+    └── index.json      # 案例索引
+```
+
+**注意：** 同步是单向的（GitHub → 本地），系统会根据文件 SHA 值判断是否需要更新。
+
 ### 知识库查询
 
 ```bash
@@ -582,20 +658,47 @@ curl http://localhost:8080/health
 
 | 级别 | 使用场景 | 示例 |
 |------|---------|------|
-| `INFO` | 正常流程信息 | `✅ SUCCESS via OpenClaw` |
-| `WARNING` | 非致命错误 | `⚠️ OpenClaw FAILED` |
-| `ERROR` | 严重错误 | `❌ KB query failed` |
-| `DEBUG` | 详细调试信息 | `Analyzing text: ...` |
+| `INFO` | 正常流程信息 | `✓ OpenClaw 服务就绪` |
+| `WARNING` | 非致命错误 | `! OpenClaw 不可用，使用回退` |
+| `ERROR` | 严重错误 | `✗ KB 查询失败` |
+| `DEBUG` | 详细调试信息 | 显示配置值、执行详情 |
 
-### 启用详细日志
+### 启用 DEBUG 模式
 
+**方式 1：环境变量**
 ```bash
-# 设置环境变量
 export LOG_LEVEL=DEBUG
-
-# 前台启动服务查看实时日志
-./start_all.sh
+./scripts/start.sh --port 8080
 ```
+
+**方式 2：命令行前缀**
+```bash
+LOG_LEVEL=DEBUG ./scripts/start.sh --port 8080
+```
+
+**DEBUG 模式输出示例：**
+```
+▶ 步骤 1/6: 检查环境依赖
+[DEBUG] 项目目录: /home/user/github-agent-v2
+[DEBUG] 虚拟环境: /home/user/github-agent-v2/venv
+[DEBUG] Python 路径: /home/user/github-agent-v2/venv/bin/python3
+[✓] Python 版本: 3.12.0
+...
+▶ 步骤 2/6: 检查配置
+[DEBUG] GITHUB_APP_ID: 2994177
+[DEBUG] GITHUB_PRIVATE_KEY_PATH: /path/to/key.pem
+[DEBUG] LOG_LEVEL: DEBUG
+```
+
+### 彩色日志输出
+
+系统支持彩色日志输出，便于快速识别信息类型：
+- 🔵 **蓝色** - INFO 级别信息
+- 🟡 **黄色** - WARNING 级别警告
+- 🔴 **红色** - ERROR 级别错误
+- 🟣 **紫色** - DEBUG 级别调试信息
+- 🟢 **绿色** - 成功状态
+- ⚪ **灰色** - 状态详情
 
 ### 常见日志模式
 
@@ -650,9 +753,11 @@ github-agent-v2/
 ├── knowledge_base/            # 知识库 (RAG)
 │   ├── kb_client.py          # KB Service 客户端
 │   ├── kb_integrator.py      # 知识库集成器
-│   ├── local_kb.py           # 本地知识库
-│   └── kb_service.py         # 知识库服务
+│   ├── kb_service.py         # 知识库服务
+│   ├── success_case_store.py # 成功案例存储
+│   └── knowledge_sync.py     # 知识库同步
 ├── code_executor/             # 代码执行层 (Ollama)
+│   ├── code_analyzer.py      # 代码分析器
 │   ├── code_generator.py     # 代码生成器
 │   ├── safe_modifier.py      # 安全代码修改
 │   ├── repo_manager.py       # Git 仓库管理
@@ -663,16 +768,23 @@ github-agent-v2/
 │   └── errors.py             # 错误定义
 ├── tests/                     # 测试框架
 ├── scripts/                   # 部署脚本
-│   ├── start.sh              # 启动脚本
+│   ├── start.sh              # 生产启动脚本（推荐）
+│   ├── start_all.sh          # 快速调试启动
 │   ├── deploy.sh             # 部署脚本
-│   └── github_repo_watcher.py # GitHub 同步
+│   └── github_repo_watcher.py # GitHub 同步工具
 ├── webhook/                   # Webhook 服务
 │   └── webhook_server.py     # Flask 服务器
+├── knowledge_base/            # 本地知识库存储（运行时创建）
+│   ├── chips/                # 芯片文档（从 GitHub 同步）
+│   ├── best_practices/       # 最佳实践文档（从 GitHub 同步）
+│   └── data/                 # 本地数据（成功案例等）
 ├── main.py                    # 主入口
 ├── requirements.txt           # 依赖
 ├── .env.example              # 环境变量模板
 ├── README.md                 # 项目文档
 ├── ARCHITECTURE.md           # 架构文档
+├── FEATURES.md               # 功能汇总
+├── DEBUG_GUIDE.md            # 调试指南
 └── GITHUB_KB_QUICKSTART.md   # 知识库快速上手
 ```
 

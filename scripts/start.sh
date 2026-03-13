@@ -253,6 +253,22 @@ show_kb_status() {
         echo "    文档数量: ${BOLD}${doc_count}${NC}"
         echo "    嵌入模型: ${CYAN}${model}${NC}"
         
+        # DEBUG 模式下显示更多信息
+        if is_debug; then
+            echo ""
+            echo "  ${BOLD}DEBUG 详情:${NC}"
+            echo "    KB_EMBEDDING_MODEL: ${KB_EMBEDDING_MODEL:-'(使用默认: nomic-embed-text)'}"
+            echo "    KB_EMBEDDING_HOST: ${KB_EMBEDDING_HOST:-'(使用默认: http://localhost:11434)'}"
+            echo "    KB_DATA_DIR: ${KB_DATA_DIR:-'(使用默认: ./knowledge_base/data)'}"
+            # 根据模型显示预期维度
+            case "${KB_EMBEDDING_MODEL:-nomic-embed-text}" in
+                nomic-embed-text*) echo "    向量维度: 768 (预期)" ;;
+                bge-m3*) echo "    向量维度: 1024 (预期)" ;;
+                all-minilm*) echo "    向量维度: 384 (预期)" ;;
+                *) echo "    向量维度: 未知 (将在首次调用时检测)" ;;
+            esac
+        fi
+        
         # 列出知识库文件
         local md_count=$(find "$PROJECT_DIR/knowledge_base" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
         if [ "$md_count" -gt 0 ]; then
