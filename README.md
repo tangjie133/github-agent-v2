@@ -146,10 +146,13 @@ OLLAMA_MODEL=qwen3-coder:30b
 ### 4. 启动服务
 
 ```bash
-# 一键启动（推荐）
+# 方法 1: 一键启动（推荐用于调试，不支持参数）
 ./start_all.sh
 
-# 或使用 Python 直接启动
+# 方法 2: 使用完整启动脚本（支持自定义参数）
+./scripts/start.sh --port 8080
+
+# 方法 3: 使用 Python 直接启动
 python main.py --port 8080
 ```
 
@@ -272,6 +275,20 @@ cd /home/tj/.npm-global/lib/node_modules/openclaw/skills/github-agent-v2
 - KB Service 后台运行，日志写入 `kb_service.log`
 - 主服务前台运行，日志直接输出到终端
 - 按 `Ctrl+C` 停止所有服务
+- ⚠️ **注意：此脚本不支持 `--port` 等参数，如需自定义端口请使用方法 2**
+
+### 方法 1.5: 完整功能启动（推荐用于生产）
+
+```bash
+cd /home/tj/.npm-global/lib/node_modules/openclaw/skills/github-agent-v2
+./scripts/start.sh --port 8080
+```
+
+**特点：**
+- 完整的启动流程，包括环境检查、依赖安装
+- 支持 GitHub 知识库自动同步
+- 支持自定义参数：`--host`、`--port`、`--log-level`
+- 美观的启动界面和状态摘要
 
 ### 方法 2: 分步启动（完全控制）
 

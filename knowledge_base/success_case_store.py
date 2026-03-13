@@ -264,7 +264,7 @@ class SuccessCaseStore:
         self._case_cache: Dict[str, SuccessCase] = {}
         self._embedding_cache: Dict[str, List[float]] = {}
         
-        logger.info(f"[SuccessCaseStore] 初始化完成，存储路径: {self.storage_path}")
+        logger.debug(f"[SuccessCaseStore] 初始化完成，存储路径: {self.storage_path}")
         
         # 加载现有案例索引
         self._load_index()

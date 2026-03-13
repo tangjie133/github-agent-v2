@@ -226,8 +226,18 @@ class GitHubRepoWatcher:
             logger.error(f"❌ 转换失败 {input_path}: {e}")
             return False
     
-    def sync_files(self, files: List[Dict], force: bool = False) -> int:
-        """同步文件到知识库"""
+    def sync_files(self, files: List[Dict], force: bool = False) -> dict:
+        """同步文件到知识库
+        
+        Returns:
+            dict: 同步统计信息 {
+                'total': 总文件数,
+                'skipped': 跳过数,
+                'success': 成功数,
+                'failed': 失败数,
+                'details': []  # 每个文件的处理详情
+            }
+        """
         # 加载同步状态
         sync_state = self._load_sync_state()
         
@@ -235,15 +245,31 @@ class GitHubRepoWatcher:
         temp_dir = Path("/tmp/github_kb_sync")
         temp_dir.mkdir(exist_ok=True)
         
-        converted = 0
-        for file_info in files:
+        # 统计信息
+        stats = {
+            'total': len(files),
+            'skipped': 0,
+            'success': 0,
+            'failed': 0,
+            'details': []
+        }
+        
+        logger.info(f"\n📋 开始处理 {len(files)} 个文件...")
+        
+        for i, file_info in enumerate(files, 1):
             file_path = file_info["path"]
             file_sha = file_info["sha"]
+            file_name = Path(file_path).name
             
             # 检查是否需要更新
             if not force and file_sha == sync_state.get(file_path):
-                logger.debug(f"⏭️  跳过（未变化）: {file_path}")
+                logger.info(f"  [{i}/{len(files)}] ⏭️  跳过（已同步）: {file_path}")
+                stats['skipped'] += 1
+                stats['details'].append({'file': file_path, 'status': 'skipped'})
                 continue
+            
+            status_icon = "🆕" if file_path not in sync_state else "📝"
+            logger.info(f"  [{i}/{len(files)}] {status_icon} 处理中: {file_path}")
             
             # 确定目标目录
             if "chip" in file_path.lower() or "芯片" in file_path:
@@ -254,6 +280,9 @@ class GitHubRepoWatcher:
             # 下载文件
             temp_file = temp_dir / Path(file_path).name
             if not self.download_file(file_path, temp_file):
+                logger.error(f"       ❌ 下载失败: {file_path}")
+                stats['failed'] += 1
+                stats['details'].append({'file': file_path, 'status': 'failed', 'reason': 'download'})
                 continue
             
             # 转换为目标 Markdown
@@ -262,7 +291,12 @@ class GitHubRepoWatcher:
             
             if self.convert_to_markdown(temp_file, target_path):
                 sync_state[file_path] = file_sha
-                converted += 1
+                stats['success'] += 1
+                stats['details'].append({'file': file_path, 'status': 'success'})
+            else:
+                logger.error(f"       ❌ 转换失败: {file_path}")
+                stats['failed'] += 1
+                stats['details'].append({'file': file_path, 'status': 'failed', 'reason': 'convert'})
             
             # 清理临时文件
             temp_file.unlink(missing_ok=True)
@@ -270,11 +304,19 @@ class GitHubRepoWatcher:
         # 保存同步状态
         self._save_sync_state(sync_state)
         
+        # 打印统计摘要
+        logger.info(f"\n📊 同步统计:")
+        logger.info(f"   总计: {stats['total']} 个文件")
+        logger.info(f"   ⏭️  跳过: {stats['skipped']} 个（已是最新）")
+        logger.info(f"   ✅ 成功: {stats['success']} 个")
+        if stats['failed'] > 0:
+            logger.info(f"   ❌ 失败: {stats['failed']} 个")
+        
         # 如果有新文件，通知 KB Service 重新加载
-        if converted > 0:
+        if stats['success'] > 0:
             self._reload_kb_service()
         
-        return converted
+        return stats
     
     def _reload_kb_service(self):
         """通知 KB Service 重新加载知识库"""
@@ -320,12 +362,14 @@ class GitHubRepoWatcher:
                 
                 files = self.get_repo_files()
                 if files:
-                    converted = self.sync_files(files)
-                    if converted > 0:
-                        logger.info(f"✅ 同步完成: {converted} 个文件")
+                    stats = self.sync_files(files)
+                    if stats['success'] > 0:
+                        logger.info(f"\n✅ 同步完成: {stats['success']} 个新文件")
                         logger.info("🔄 请重启 KB Service 以加载新文档")
+                    elif stats['failed'] > 0:
+                        logger.warning(f"\n⚠️  同步完成，但有 {stats['failed']} 个文件失败")
                     else:
-                        logger.info("✓ 所有文件已是最新")
+                        logger.info("\n✓ 所有文件已是最新")
                 
                 time.sleep(interval)
                 
@@ -406,10 +450,15 @@ def main():
         logger.info(f"🔄 开始同步: {args.repo}")
         files = watcher.get_repo_files()
         if files:
-            converted = watcher.sync_files(files, args.force)
-            logger.info(f"\n✅ 同步完成: {converted} 个文件")
-            logger.info(f"\n🚀 重启服务以加载新文档:")
-            logger.info(f"   ./scripts/start.sh --port 8080")
+            stats = watcher.sync_files(files, args.force)
+            # 最终摘要
+            if stats['success'] > 0:
+                logger.info(f"\n✅ 同步成功: {stats['success']} 个新文件")
+                logger.info(f"💡 提示: 重启 KB Service 以加载新文档")
+            elif stats['failed'] > 0:
+                logger.error(f"\n❌ 同步失败: {stats['failed']} 个文件失败")
+            else:
+                logger.info(f"\n✓ 所有文件已是最新 ({stats['skipped']} 个)")
     
     elif args.daemon:
         # 后台模式

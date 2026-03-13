@@ -37,7 +37,7 @@ class CodeGenerator:
         self.host = host or os.environ.get("OLLAMA_HOST", "http://localhost:11434")
         self.base_url = self.host  # 别名，方便访问
         
-        logger.info(f"代码生成器初始化: 模型={self.model}, 地址={self.host}")
+        logger.debug(f"代码生成器初始化: 模型={self.model}, 地址={self.host}")
     
     def generate_modification(
         self,

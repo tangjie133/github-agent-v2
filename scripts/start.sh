@@ -3,17 +3,18 @@
 # GitHub Agent V2 启动脚本
 #
 
-set -e
+# 错误处理：遇到错误继续执行，但会报告
+set +e
 
-# 颜色定义
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-MAGENTA='\033[0;35m'
-NC='\033[0m' # No Color
-BOLD='\033[1m'
+# 颜色定义 (使用 ANSI 转义序列)
+RED=$'\033[0;31m'
+GREEN=$'\033[0;32m'
+YELLOW=$'\033[1;33m'
+BLUE=$'\033[0;34m'
+CYAN=$'\033[0;36m'
+MAGENTA=$'\033[0;35m'
+NC=$'\033[0m' # No Color
+BOLD=$'\033[1m'
 
 # 项目目录
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -46,31 +47,32 @@ LOG_LEVEL="${LOG_LEVEL:-INFO}"
 
 # 打印信息
 info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
+    echo "${BLUE}[INFO]${NC} $1"
 }
 
 success() {
-    echo -e "${GREEN}[✓]${NC} $1"
+    echo "${GREEN}[✓]${NC} $1"
 }
 
 warning() {
-    echo -e "${YELLOW}[!]${NC} $1"
+    echo "${YELLOW}[!]${NC} $1"
 }
 
 error() {
-    echo -e "${RED}[✗]${NC} $1"
+    echo "${RED}[✗]${NC} $1"
 }
 
 step() {
-    echo -e "\n${CYAN}${BOLD}▶ $1${NC}"
+    echo ""
+    echo "${CYAN}${BOLD}▶ $1${NC}"
 }
 
 # 显示 Banner
 show_banner() {
     echo ""
-    echo -e "${MAGENTA}${BOLD}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${MAGENTA}${BOLD}║${NC}            ${CYAN}${BOLD}GitHub Agent V2${NC} - 智能 Issue 处理系统           ${MAGENTA}${BOLD}║${NC}"
-    echo -e "${MAGENTA}${BOLD}╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo "${MAGENTA}${BOLD}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo "${MAGENTA}${BOLD}║${NC}            ${CYAN}${BOLD}GitHub Agent V2${NC} - 智能 Issue 处理系统           ${MAGENTA}${BOLD}║${NC}"
+    echo "${MAGENTA}${BOLD}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
 }
 
@@ -182,17 +184,37 @@ show_kb_status() {
         local doc_count=$(echo "$stats" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('total_documents',0))" 2>/dev/null || echo "0")
         local model=$(echo "$stats" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('embedding_model','unknown'))" 2>/dev/null || echo "unknown")
         
-        success "知识库服务正常"
-        echo "    文档数: ${BOLD}$doc_count${NC}"
-        echo "    嵌入模型: $model"
+        success "知识库服务就绪"
+        echo ""
+        echo "  ${BOLD}服务信息:${NC}"
+        echo "    服务地址: ${CYAN}${kb_url}${NC}"
+        echo "    文档数量: ${BOLD}${doc_count}${NC}"
+        echo "    嵌入模型: ${CYAN}${model}${NC}"
         
         # 列出知识库文件
-        local md_count=$(find "$PROJECT_DIR/knowledge_base" -name "*.md" 2>/dev/null | wc -l)
+        local md_count=$(find "$PROJECT_DIR/knowledge_base" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
         if [ "$md_count" -gt 0 ]; then
-            echo "    本地文件: ${md_count} 个 Markdown"
+            echo "    本地文件: ${BOLD}${md_count}${NC} 个 Markdown"
         fi
+        echo ""
     else
         warning "知识库服务未就绪"
+        echo ""
+        echo "  ${BOLD}诊断信息:${NC}"
+        echo "    服务地址: ${CYAN}${kb_url}${NC}"
+        echo ""
+        echo "  ${BOLD}可能原因:${NC}"
+        echo "    1. KB Service 未启动"
+        echo "    2. 服务地址配置错误"
+        echo "    3. 网络连接问题"
+        echo ""
+        echo "  ${BOLD}解决方案:${NC}"
+        echo "    1. 检查 KB Service 是否运行:"
+        echo "       ${CYAN}curl ${kb_url}/health${NC}"
+        echo "    2. 手动启动 KB Service:"
+        echo "       ${CYAN}python3 -m knowledge_base.kb_service${NC}"
+        echo "    3. 检查环境变量 KB_SERVICE_URL 配置"
+        echo ""
     fi
 }
 
@@ -200,13 +222,17 @@ show_kb_status() {
 start_kb_service() {
     step "步骤 4/6: 启动知识库服务"
     
+    # 服务监听配置（用于启动服务）
     KB_HOST="${KB_SERVICE_HOST:-0.0.0.0}"
     KB_PORT="${KB_SERVICE_PORT:-8000}"
-    KB_URL="http://$KB_HOST:$KB_PORT"
+    # 服务连接配置（用于检查连接）
+    KB_URL="${KB_SERVICE_URL:-http://$KB_HOST:$KB_PORT}"
     
     # 检查是否已有 KB Service 在运行
     if curl -s "$KB_URL/health" > /dev/null 2>&1; then
-        success "KB Service 已在运行 ($KB_URL)"
+        success "知识库服务已在运行"
+        echo ""
+        echo "  ${BOLD}服务地址:${NC} ${CYAN}${KB_URL}${NC}"
         show_kb_status
         return 0
     fi
@@ -289,8 +315,11 @@ sync_github_kb_if_enabled() {
     step "步骤 3/6: 同步 GitHub 知识库"
     
     if ! is_github_kb_enabled; then
-        warning "GitHub 知识库同步未启用"
-        info "设置 KB_GITHUB_SYNC_ENABLED=true 以启用"
+        info "GitHub 知识库同步未启用"
+        echo ""
+        echo "  ${BOLD}启用方式:${NC}"
+        echo "    设置 ${CYAN}KB_GITHUB_SYNC_ENABLED=true${NC} 以启用"
+        echo "    设置 ${CYAN}KB_REPO=owner/repo${NC} 指定仓库"
         echo ""
         return 0
     fi
@@ -301,27 +330,40 @@ sync_github_kb_if_enabled() {
     local repo="${KB_REPO:-tangjie133/knowledge-base}"
     local branch="${KB_BRANCH:-main}"
     
-    info "仓库: ${BOLD}$repo${NC}"
-    info "分支: ${BOLD}$branch${NC}"
-    [ -n "$http_proxy" ] && info "使用代理: ${http_proxy}"
+    echo ""
+    echo "  ${BOLD}同步配置:${NC}"
+    echo "    仓库: ${CYAN}${repo}${NC}"
+    echo "    分支: ${CYAN}${branch}${NC}"
+    [ -n "$http_proxy" ] && echo "    代理: ${CYAN}${http_proxy}${NC}"
+    echo ""
     
     cd "$PROJECT_DIR"
     
     # 前台执行同步，等待完成
-    info "正在同步..."
+    info "开始同步..."
+    echo ""
+    
     if python3 scripts/github_repo_watcher.py --sync; then
         success "同步完成"
         
-        # 统计同步的文件
-        local md_count=$(find knowledge_base/chips knowledge_base/best_practices -name "*.md" 2>/dev/null | wc -l)
-        local pdf_count=$(find knowledge_base/chips knowledge_base/best_practices -name "*.pdf" 2>/dev/null | wc -l)
+        # 显示本地知识库统计
+        local md_count=$(find knowledge_base/chips knowledge_base/best_practices -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
+        local pdf_count=$(find knowledge_base/chips knowledge_base/best_practices -name "*.pdf" 2>/dev/null | wc -l | tr -d ' ')
         
         echo ""
-        echo "  同步结果:"
-        echo "    Markdown 文件: $md_count"
-        [ "$pdf_count" -gt 0 ] && echo "    PDF 文件: $pdf_count"
+        echo "  ${BOLD}本地知识库统计:${NC}"
+        echo "    Markdown 文件: ${BOLD}${md_count}${NC}"
+        [ "$pdf_count" -gt 0 ] && echo "    PDF 文件: ${BOLD}${pdf_count}${NC}"
+        echo ""
     else
         warning "同步失败或部分失败"
+        echo ""
+        echo "  ${BOLD}建议操作:${NC}"
+        echo "    1. 检查网络连接和代理设置"
+        echo "    2. 验证 GITHUB_TOKEN 是否有效"
+        echo "    3. 手动执行同步查看详细错误:"
+        echo "       ${CYAN}python3 scripts/github_repo_watcher.py --sync${NC}"
+        echo ""
         info "将继续启动，知识库可能不完整"
     fi
     
@@ -341,36 +383,60 @@ start_github_kb_daemon_if_enabled() {
     local sync_interval="${KB_SYNC_INTERVAL:-0}"
     local webhook_enabled="${KB_WEBHOOK_ENABLED:-false}"
     local webhook_port="${KB_WEBHOOK_PORT:-9000}"
+    local kb_repo="${KB_REPO:-tangjie133/knowledge-base}"
     
-    info "启动后台监控..."
+    step "步骤 5/6: 启动后台监控"
+    
+    local daemon_count=0
     
     # 如果启用了定时同步
     if [ "$sync_interval" -gt 0 ] 2>/dev/null; then
-        info "定时同步: 每 ${sync_interval} 秒"
         nohup python3 scripts/github_repo_watcher.py --daemon --interval "$sync_interval" > /tmp/github_kb_sync.log 2>&1 &
         WATCHER_PID=$!
         echo $WATCHER_PID > "$WATCHER_PID_FILE"
-        success "定时同步已启动 (PID: $WATCHER_PID)"
+        success "定时同步已启动"
+        echo ""
+        echo "  ${BOLD}监控配置:${NC}"
+        echo "    监控仓库: ${CYAN}${kb_repo}${NC}"
+        echo "    同步间隔: 每 ${BOLD}${sync_interval}${NC} 秒"
+        echo "    日志文件: ${CYAN}/tmp/github_kb_sync.log${NC}"
+        echo "    进程 PID: ${YELLOW}${WATCHER_PID}${NC}"
+        echo ""
+        daemon_count=$((daemon_count + 1))
     fi
     
     # 如果启用了 Webhook
     if [ "$webhook_enabled" == "true" ]; then
-        info "Webhook 服务器: http://0.0.0.0:$webhook_port"
         nohup python3 scripts/github_webhook_server.py --port "$webhook_port" > /tmp/github_webhook.log 2>&1 &
         WEBHOOK_PID=$!
         echo $WEBHOOK_PID > "$WEBHOOK_PID_FILE"
-        success "Webhook 服务器已启动 (PID: $WEBHOOK_PID)"
+        success "Webhook 服务器已启动"
         
         # 获取本机 IP
         local ip=$(hostname -I | awk '{print $1}')
         echo ""
-        echo -e "  ${YELLOW}提示: 在 GitHub 仓库设置 Webhook${NC}"
-        echo "    Payload URL: http://$ip:$webhook_port/webhook"
-        echo "    Secret: ${KB_WEBHOOK_SECRET:-'(未设置)'}"
-        echo "    事件: Just the push event"
+        echo "  ${BOLD}Webhook 配置:${NC}"
+        echo "    服务地址: ${CYAN}http://0.0.0.0:${webhook_port}${NC}"
+        echo "    日志文件: ${CYAN}/tmp/github_webhook.log${NC}"
+        echo "    进程 PID: ${YELLOW}${WEBHOOK_PID}${NC}"
+        echo ""
+        echo "  ${YELLOW}配置提示:${NC} 在 GitHub 仓库设置 Webhook"
+        echo "    Payload URL: ${CYAN}http://${ip}:${webhook_port}/webhook${NC}"
+        echo "    Content type: ${CYAN}application/json${NC}"
+        echo "    Secret:       ${KB_WEBHOOK_SECRET:-'(未设置)'}"
+        echo "    事件:         ${CYAN}Just the push event${NC}"
+        echo ""
+        daemon_count=$((daemon_count + 1))
     fi
     
-    echo ""
+    if [ "$daemon_count" -eq 0 ]; then
+        info "后台监控未启用"
+        echo ""
+        echo "  ${BOLD}启用方式:${NC}"
+        echo "    定时同步: 设置 ${CYAN}KB_SYNC_INTERVAL=300${NC}（秒）"
+        echo "    Webhook:  设置 ${CYAN}KB_WEBHOOK_ENABLED=true${NC}"
+        echo ""
+    fi
 }
 
 # 停止 GitHub 知识库同步
@@ -418,55 +484,65 @@ show_status_summary() {
     local ollama_host="${OLLAMA_HOST:-http://localhost:11434}"
     
     echo ""
-    echo -e "${GREEN}${BOLD}┌─────────────────────────────────────────────────────────────┐${NC}"
-    echo -e "${GREEN}${BOLD}│${NC}                      服务启动就绪                            ${GREEN}${BOLD}│${NC}"
-    echo -e "${GREEN}${BOLD}└─────────────────────────────────────────────────────────────┘${NC}"
+    echo "${GREEN}${BOLD}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo "${GREEN}${BOLD}║${NC}                      🚀 服务启动就绪                          ${GREEN}${BOLD}║${NC}"
+    echo "${GREEN}${BOLD}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
     
-    # 服务状态表格
-    echo -e "  ${BOLD}服务状态:${NC}"
-    echo "  ┌────────────────────┬────────────────────────────────────────┐"
+    # 核心服务状态
+    echo "  ${BOLD}核心服务状态:${NC}"
+    echo ""
     
     # Ollama
     if curl -s "$ollama_host/api/tags" > /dev/null 2>&1; then
-        echo -e "  │ ${GREEN}✓${NC} Ollama          │ $ollama_host                    │"
+        echo "    ${GREEN}✓${NC} ${BOLD}Ollama${NC}         ${GREEN}运行中${NC}  ${CYAN}${ollama_host}${NC}"
     else
-        echo -e "  │ ${RED}✗${NC} Ollama          │ $ollama_host (未连接)            │"
+        echo "    ${RED}✗${NC} ${BOLD}Ollama${NC}         ${RED}未连接${NC}  ${ollama_host}"
     fi
     
     # KB Service
     if curl -s "$kb_url/stats" > /dev/null 2>&1; then
         local doc_count=$(curl -s "$kb_url/stats" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('total_documents',0))" 2>/dev/null)
-        echo -e "  │ ${GREEN}✓${NC} 知识库服务      │ $kb_url (${doc_count} 文档)           │"
+        echo "    ${GREEN}✓${NC} ${BOLD}知识库服务${NC}     ${GREEN}运行中${NC}  ${kb_url} (${doc_count} 文档)"
     else
-        echo -e "  │ ${RED}✗${NC} 知识库服务      │ $kb_url (未启动)                  │"
+        echo "    ${RED}✗${NC} ${BOLD}知识库服务${NC}     ${RED}未启动${NC}  ${kb_url}"
     fi
     
     # GitHub KB 同步
     if is_github_kb_enabled; then
-        echo -e "  │ ${GREEN}✓${NC} GitHub 同步     │ ${KB_REPO:-tangjie133/knowledge-base} │"
+        echo "    ${GREEN}✓${NC} ${BOLD}GitHub 同步${NC}    ${GREEN}已启用${NC}  ${KB_REPO:-tangjie133/knowledge-base}"
     else
-        echo -e "  │ ${YELLOW}!${NC} GitHub 同步     │ 未启用                              │"
+        echo "    ${YELLOW}!${NC} ${BOLD}GitHub 同步${NC}    ${YELLOW}未启用${NC}"
     fi
-    
-    echo "  └────────────────────┴────────────────────────────────────────┘"
+    echo ""
     
     # 访问地址
+    echo "  ${BOLD}访问地址:${NC}"
     echo ""
-    echo -e "  ${BOLD}访问地址:${NC}"
-    echo "  ┌─────────────────────────────────────────────────────────────┐"
-    echo -e "  │  ${CYAN}主服务${NC}        http://${HOST}:${PORT}                      │"
-    echo -e "  │  ${CYAN}健康检查${NC}      http://${HOST}:${PORT}/health                │"
-    echo -e "  │  ${CYAN}Webhook${NC}       http://${HOST}:${PORT}/webhook/github        │"
-    echo -e "  │  ${CYAN}知识库 API${NC}    ${KB_SERVICE_URL:-http://localhost:8000}                   │"
-    echo "  └─────────────────────────────────────────────────────────────┘"
+    printf "    %-15s ${CYAN}http://${HOST}:${PORT}${NC}\n" "主服务:"
+    printf "    %-15s ${CYAN}http://${HOST}:${PORT}/health${NC}\n" "健康检查:"
+    printf "    %-15s ${CYAN}http://${HOST}:${PORT}/webhook/github${NC}\n" "Webhook:"
+    printf "    %-15s ${CYAN}${KB_SERVICE_URL:-http://localhost:8000}${NC}\n" "知识库 API:"
+    echo ""
+    
+    # 日志文件位置
+    echo "  ${BOLD}日志文件:${NC}"
+    echo ""
+    printf "    %-15s ${CYAN}/tmp/kb_service.log${NC}\n" "知识库服务:"
+    if [ -f "$WATCHER_PID_FILE" ]; then
+        printf "    %-15s ${CYAN}/tmp/github_kb_sync.log${NC}\n" "定时同步:"
+    fi
+    if [ -f "$WEBHOOK_PID_FILE" ]; then
+        printf "    %-15s ${CYAN}/tmp/github_webhook.log${NC}\n" "Webhook:"
+    fi
+    echo ""
     
     # 使用提示
+    echo "  ${BOLD}使用提示:${NC}"
     echo ""
-    echo -e "  ${BOLD}使用提示:${NC}"
-    echo "  • 在 Issue 中提及 @agent 来触发处理"
-    echo "  • 按 Ctrl+C 停止所有服务"
-    echo "  • 查看日志: tail -f /tmp/kb_service.log"
+    echo "    1. 在 GitHub Issue 中提及 @agent 来触发智能处理"
+    echo "    2. 按 Ctrl+C 停止所有服务"
+    echo "    3. 使用 tail -f /tmp/kb_service.log 查看实时日志"
     echo ""
 }
 

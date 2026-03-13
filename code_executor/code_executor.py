@@ -79,12 +79,13 @@ class CodeExecutor:
         # 存储执行过程中的原始内容，用于创建案例
         self._execution_context = {}
         
-        logger.info("[CodeExecutor] 代码执行器初始化完成")
-        logger.info(f"[CodeExecutor]   案例存储: {'已启用' if self.case_store else '未启用'}")
-        logger.info(f"[CodeExecutor]   知识同步: {'已启用' if self.sync_manager else '未启用'}")
+        # 初始化日志改为 debug 级别，避免启动时输出过多信息
+        logger.debug("[CodeExecutor] 代码执行器初始化完成")
+        logger.debug(f"[CodeExecutor]   案例存储: {'已启用' if self.case_store else '未启用'}")
+        logger.debug(f"[CodeExecutor]   知识同步: {'已启用' if self.sync_manager else '未启用'}")
         
         if self.sync_manager:
-            logger.info(f"[CodeExecutor]   知识库仓库: {self.sync_manager.knowledge_repo_url}")
+            logger.debug(f"[CodeExecutor]   知识库仓库: {self.sync_manager.knowledge_repo_url}")
     
     def execute_task(
         self,

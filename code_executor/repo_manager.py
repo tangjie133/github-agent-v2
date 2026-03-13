@@ -37,7 +37,7 @@ class RepositoryManager:
         ))
         self.work_dir.mkdir(parents=True, exist_ok=True)
         
-        logger.info(f"仓库管理器初始化: 工作目录={self.work_dir}")
+        logger.debug(f"仓库管理器初始化: 工作目录={self.work_dir}")
     
     def get_repo_path(self, owner: str, repo: str) -> Path:
         """

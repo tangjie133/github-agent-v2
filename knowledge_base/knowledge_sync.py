@@ -72,10 +72,11 @@ class KnowledgeSyncManager:
         # 加载同步状态
         self._load_sync_state()
         
-        logger.info(f"[KnowledgeSync] 初始化完成")
-        logger.info(f"[KnowledgeSync]   资料仓库: {knowledge_repo_url}")
-        logger.info(f"[KnowledgeSync]   本地路径: {local_kb_path}")
-        logger.info(f"[KnowledgeSync]   同步间隔: {sync_interval}秒")
+        # 初始化日志改为 debug 级别
+        logger.debug(f"[KnowledgeSync] 初始化完成")
+        logger.debug(f"[KnowledgeSync]   资料仓库: {knowledge_repo_url}")
+        logger.debug(f"[KnowledgeSync]   本地路径: {local_kb_path}")
+        logger.debug(f"[KnowledgeSync]   同步间隔: {sync_interval}秒")
     
     # ============================================================================
     # 核心同步方法
