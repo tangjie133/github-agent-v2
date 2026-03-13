@@ -246,11 +246,12 @@ KB_SERVICE_URL=http://localhost:8000
 # KB_EMBEDDING_MODEL=nomic-embed-text  # 可选: bge-m3, all-minilm 等
 # KB_EMBEDDING_HOST=http://localhost:11434
 
-# HNSW 向量检索配置（高性能近似最近邻）
-# KB_USE_HNSW=true                    # 启用 HNSW 加速（默认 true）
-# KB_HNSW_EF_CONSTRUCTION=200         # 构建精度（默认 200，越大越慢但精度越高）
-# KB_HNSW_M=16                        # 节点连接数（默认 16）
-# KB_HNSW_EF=50                       # 查询精度（默认 50，越大精度越高）
+# ChromaDB 向量数据库配置（自动持久化 + 内置 HNSW）
+# KB_CHROMA_DIR=./knowledge_base/chroma_db  # 持久化目录（默认）
+
+# PDF 处理配置（多线程并行）
+# KB_PDF_WORKERS=8                       # 线程数（默认 CPU/3，24核→8线程）
+# KB_PDF_PARALLEL_THRESHOLD=3            # 启用并行阈值（默认 3页）
 
 KB_TIMEOUT=30
 ```

@@ -21,6 +21,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# 抑制第三方库的 DEBUG 日志
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("urllib3.connectionpool").setLevel(logging.WARNING)
+
 # 尝试导入必要的库
 try:
     import numpy as np

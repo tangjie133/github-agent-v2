@@ -36,6 +36,10 @@ import logging
 # 添加项目路径
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+# 抑制第三方库的 DEBUG 日志
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("requests").setLevel(logging.WARNING)
+
 # 日志配置（如果作为主程序运行）
 if __name__ == "__main__":
     log_level = os.environ.get('LOG_LEVEL', 'INFO').upper()
@@ -44,6 +48,9 @@ if __name__ == "__main__":
         format='%(asctime)s [%(name)s] %(levelname)s: %(message)s',
         datefmt='%H:%M:%S'
     )
+    # 再次确保第三方库日志级别
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("requests").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # 默认配置
@@ -361,10 +368,14 @@ class GitHubRepoWatcher:
             
             logger.info(f"📄 直接处理 PDF: {pdf_path.name}")
             
-            # 初始化组件
-            embedder = SimpleEmbedding()
+            # 初始化组件（使用环境变量配置）
+            embedder = SimpleEmbedding(
+                model=os.environ.get("KB_EMBEDDING_MODEL", "nomic-embed-text"),
+                host=os.environ.get("KB_EMBEDDING_HOST", "http://localhost:11434")
+            )
             vector_store = ChromaVectorStore()
-            processor = PDFProcessor(embedder=embedder, max_workers=2)
+            pdf_workers = int(os.environ.get("KB_PDF_WORKERS", 0)) or None  # 0 表示使用默认值
+            processor = PDFProcessor(embedder=embedder, max_workers=pdf_workers)
             
             # 如果是更新，先删除旧向量
             if is_update:
