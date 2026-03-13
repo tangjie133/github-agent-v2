@@ -218,6 +218,7 @@ check_env() {
         echo "    KB_SERVICE_URL: ${KB_SERVICE_URL}"
         echo "    OLLAMA_HOST: ${OLLAMA_HOST}"
         echo "    WORKDIR: ${GITHUB_AGENT_WORKDIR:-/tmp/github-agent-v2}"
+        echo "    STATEDIR: ${GITHUB_AGENT_STATEDIR:-$(dirname "$PROJECT_DIR")/.github_kb_sync_state.json}"
     fi
     
     # 代理状态
@@ -269,10 +270,26 @@ show_kb_status() {
             esac
         fi
         
-        # 列出知识库文件
-        local md_count=$(find "$PROJECT_DIR/knowledge_base" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
-        if [ "$md_count" -gt 0 ]; then
-            echo "    本地文件: ${BOLD}${md_count}${NC} 个 Markdown"
+        # 列出知识库文件（按目录统计）
+        local chips_count=$(find "$PROJECT_DIR/knowledge_base/chips" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
+        local practices_count=$(find "$PROJECT_DIR/knowledge_base/best_practices" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
+        local total_count=$((chips_count + practices_count))
+        
+        if [ "$total_count" -gt 0 ]; then
+            echo "    本地文件: ${BOLD}${total_count}${NC} 个 Markdown"
+            if is_debug; then
+                echo ""
+                echo "  ${BOLD}文件分布:${NC}"
+                echo "    chips/:          ${BOLD}${chips_count}${NC} 个"
+                echo "    best_practices/: ${BOLD}${practices_count}${NC} 个"
+                # 列出具体文件
+                echo ""
+                echo "  ${BOLD}文件列表:${NC}"
+                find "$PROJECT_DIR/knowledge_base" -name "*.md" 2>/dev/null | while read f; do
+                    local rel_path=$(echo "$f" | sed "s|$PROJECT_DIR/knowledge_base/||")
+                    echo "    • ${rel_path}"
+                done
+            fi
         fi
         echo ""
     else

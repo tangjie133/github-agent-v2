@@ -51,10 +51,175 @@ DEFAULT_REPO = "tangjie133/knowledge-base"
 DEFAULT_BRANCH = "main"
 KB_CHIPS_DIR = Path(__file__).parent.parent / "knowledge_base" / "chips"
 KB_PRACTICES_DIR = Path(__file__).parent.parent / "knowledge_base" / "best_practices"
-SYNC_STATE_FILE = Path(__file__).parent.parent / ".github_kb_sync_state.json"
 
 # 支持的文件格式
 SUPPORTED_EXTS = {'.md', '.txt', '.pdf', '.docx'}
+
+# 基础目录
+KB_BASE_DIR = Path(__file__).parent.parent / "knowledge_base"
+
+# 同步状态文件路径（支持环境变量配置）
+_state_dir = os.environ.get("GITHUB_AGENT_STATEDIR")
+if _state_dir:
+    SYNC_STATE_FILE = Path(_state_dir) / ".github_kb_sync_state.json"
+else:
+    SYNC_STATE_FILE = Path(__file__).parent.parent / ".github_kb_sync_state.json"
+
+
+class ContentClassifier:
+    """
+    智能内容分类器
+    
+    支持多种分类策略：
+    1. 配置文件规则（用户自定义）
+    2. 文件内容启发式分析
+    3. AI 辅助分类（使用 Ollama）
+    """
+    
+    def __init__(self, config_file: str = None):
+        self.config_file = config_file or os.environ.get("KB_CLASSIFIER_CONFIG")
+        self.rules = self._load_rules()
+        self.ollama_host = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+        self.ollama_model = os.environ.get("KB_CLASSIFIER_MODEL", "qwen2.5:7b")
+        
+    def _load_rules(self) -> Dict:
+        """加载分类规则"""
+        default_rules = {
+            "categories": {
+                "chips": {
+                    "keywords": ["芯片", "datasheet", "数据手册", "specification", "规格书"],
+                    "file_patterns": ["*chip*", "*datasheet*", "*硬件*", "*hardware*"],
+                    "content_indicators": ["型号", "参数", "引脚", "电气特性"]
+                },
+                "best_practices": {
+                    "keywords": ["指南", "教程", "最佳实践", "guide", "tutorial"],
+                    "file_patterns": ["*guide*", "*tutorial*", "*practice*"],
+                    "content_indicators": ["步骤", "方法", "建议", "示例"]
+                }
+            },
+            "default_category": "best_practices",
+            "use_ai": False  # 默认不使用AI，避免额外延迟
+        }
+        
+        if self.config_file and Path(self.config_file).exists():
+            try:
+                with open(self.config_file, 'r', encoding='utf-8') as f:
+                    user_rules = json.load(f)
+                    default_rules.update(user_rules)
+                    logger.info(f"已加载分类规则: {self.config_file}")
+            except Exception as e:
+                logger.warning(f"加载分类规则失败: {e}，使用默认规则")
+        
+        return default_rules
+    
+    def classify(self, file_path: str, content: str = None) -> str:
+        """
+        分类文件，返回类别目录名
+        
+        Args:
+            file_path: 文件路径
+            content: 文件内容（可选，用于内容分析）
+            
+        Returns:
+            类别目录名（如 "chips", "best_practices"）
+        """
+        path_lower = file_path.lower()
+        filename = Path(file_path).name.lower()
+        
+        # 策略1: 文件名匹配
+        for category, rules in self.rules["categories"].items():
+            # 检查文件模式
+            for pattern in rules.get("file_patterns", []):
+                pattern_lower = pattern.lower().replace("*", "")
+                if pattern_lower in filename or pattern_lower in path_lower:
+                    return category
+            
+            # 检查关键词
+            for keyword in rules.get("keywords", []):
+                if keyword.lower() in filename or keyword.lower() in path_lower:
+                    return category
+        
+        # 策略2: 内容分析（如果有内容）
+        if content:
+            category = self._classify_by_content(content)
+            if category:
+                return category
+        
+        # 策略3: AI 分类（如果启用）
+        if self.rules.get("use_ai", False) and content:
+            category = self._classify_by_ai(file_path, content)
+            if category:
+                return category
+        
+        # 默认分类
+        return self.rules.get("default_category", "best_practices")
+    
+    def _classify_by_content(self, content: str) -> str:
+        """基于内容启发式分类"""
+        content_lower = content[:2000].lower()  # 只检查前2000字符
+        
+        scores = {}
+        for category, rules in self.rules["categories"].items():
+            score = 0
+            for indicator in rules.get("content_indicators", []):
+                if indicator.lower() in content_lower:
+                    score += 1
+            scores[category] = score
+        
+        # 返回得分最高的类别（至少要有1分）
+        if scores:
+            best_category = max(scores, key=scores.get)
+            if scores[best_category] > 0:
+                return best_category
+        
+        return None
+    
+    def _classify_by_ai(self, file_path: str, content: str) -> str:
+        """使用 Ollama AI 分类"""
+        try:
+            import requests
+            
+            # 准备提示词
+            prompt = f"""请分析以下文档内容，判断它属于哪一类：
+
+文件名: {file_path}
+内容摘要: {content[:1000]}...
+
+可选类别:
+{json.dumps(list(self.rules["categories"].keys()), ensure_ascii=False, indent=2)}
+
+请只返回类别名称，不要解释。"""
+
+            response = requests.post(
+                f"{self.ollama_host}/api/generate",
+                json={
+                    "model": self.ollama_model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {"temperature": 0.1}
+                },
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                result = response.json().get("response", "").strip().lower()
+                # 验证返回的类别是否有效
+                for category in self.rules["categories"].keys():
+                    if category.lower() in result:
+                        return category
+                        
+        except Exception as e:
+            logger.debug(f"AI 分类失败: {e}")
+        
+        return None
+    
+    def get_category_dir(self, category: str) -> Path:
+        """获取类别的本地目录"""
+        return KB_BASE_DIR / category
+    
+    def list_categories(self) -> List[str]:
+        """列出所有可用类别"""
+        return list(self.rules["categories"].keys())
 
 
 class GitHubRepoWatcher:
@@ -287,7 +452,8 @@ class GitHubRepoWatcher:
             logger.info(f"  [{i}/{len(files)}] {status_icon} 处理中: {file_path}")
             
             # 确定目标目录
-            if "chip" in file_path.lower() or "芯片" in file_path:
+            path_lower = file_path.lower()
+            if any(keyword in path_lower for keyword in ["chip", "芯片", "hardware", "datasheet"]):
                 target_dir = KB_CHIPS_DIR
             else:
                 target_dir = KB_PRACTICES_DIR
@@ -363,6 +529,7 @@ class GitHubRepoWatcher:
     
     def _save_sync_state(self, state: Dict[str, str]):
         """保存同步状态"""
+        SYNC_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         SYNC_STATE_FILE.write_text(json.dumps(state, indent=2))
     
     def run_daemon(self, interval: int = 300):
