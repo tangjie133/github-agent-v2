@@ -103,233 +103,167 @@ class SimpleEmbedding:
         return [self.embed(t) for t in texts]
 
 
-class SimpleVectorStore:
-    """简化版向量存储（暴力搜索，适合小数据量）"""
-    
-    def __init__(self):
-        self.documents: List[Dict[str, Any]] = []
-        self.embeddings: List[List[float]] = []
-        
-    def add(self, text: str, metadata: Dict[str, Any] = None):
-        """添加文档"""
-        self.documents.append({
-            "text": text,
-            "metadata": metadata or {}
-        })
-    
-    def add_with_embedding(self, text: str, embedding: List[float], metadata: Dict[str, Any] = None):
-        """添加带嵌入的文档"""
-        self.documents.append({
-            "text": text,
-            "metadata": metadata or {}
-        })
-        self.embeddings.append(embedding)
-    
-    def search(self, query_embedding: List[float], top_k: int = 3) -> List[Dict[str, Any]]:
-        """相似度搜索（暴力 O(n)）"""
-        if not self.embeddings or not HAS_NUMPY:
-            return []
-        
-        # 计算余弦相似度
-        query_vec = np.array(query_embedding)
-        doc_vecs = np.array(self.embeddings)
-        
-        # 归一化
-        query_vec = query_vec / (np.linalg.norm(query_vec) + 1e-8)
-        doc_vecs = doc_vecs / (np.linalg.norm(doc_vecs, axis=1, keepdims=True) + 1e-8)
-        
-        # 计算相似度
-        similarities = np.dot(doc_vecs, query_vec)
-        
-        # 获取 top_k
-        top_indices = np.argsort(similarities)[-top_k:][::-1]
-        
-        results = []
-        for idx in top_indices:
-            results.append({
-                "text": self.documents[idx]["text"],
-                "metadata": self.documents[idx]["metadata"],
-                "similarity": float(similarities[idx])
-            })
-        
-        return results
+# 强制导入 ChromaDB（成为必需依赖）
+import chromadb
+from chromadb.config import Settings
 
 
-class HNSWVectorStore:
+class ChromaVectorStore:
     """
-    HNSW 向量存储（近似最近邻，O(log n)）
+    ChromaDB 向量存储（自动持久化 + 内置 HNSW）
     
-    使用 HNSW (Hierarchical Navigable Small World) 算法实现高效向量检索。
-    适合大规模数据（1万+ 文档），检索速度比暴力搜索快 10-100 倍。
+    使用 ChromaDB 作为后端，自动持久化到磁盘，内置 HNSW 索引。
+    支持增量更新、元数据过滤、距离度量配置。
     
     参数:
-        space: 距离度量，'cosine' 或 'l2'（默认 cosine）
-        ef_construction: 构建时的搜索范围，越大精度越高（默认 200）
-        M: 每个节点的最大连接数，越大内存占用越高（默认 16）
-        ef: 查询时的搜索范围，越大精度越高（默认 50）
+        persist_dir: 持久化目录（默认 ./knowledge_base/chroma_db）
+        collection_name: 集合名称（默认 knowledge_base）
+        distance_fn: 距离函数（默认 cosine，可选 l2, ip）
     """
     
-    def __init__(self, space: str = 'cosine', dim: int = None, 
-                 ef_construction: int = 200, M: int = 16, ef: int = 50):
-        self.space = space
-        self.dim = dim  # 将在添加第一个文档时确定
-        self.ef_construction = ef_construction
-        self.M = M
-        self.ef = ef
+    def __init__(self, persist_dir: str = None, collection_name: str = "knowledge_base",
+                 distance_fn: str = "cosine"):
+        self.persist_dir = persist_dir or os.environ.get("KB_CHROMA_DIR", "./knowledge_base/chroma_db")
+        self.collection_name = collection_name
+        self.distance_fn = distance_fn
         
-        self.documents: List[Dict[str, Any]] = []
-        self._index = None  # HNSW 索引，延迟初始化
-        self._id_counter = 0  # 文档 ID 计数器
-        
-        # 尝试导入 hnswlib
+        # 初始化 ChromaDB 客户端
         try:
-            import hnswlib
-            self._hnswlib = hnswlib
-            self._has_hnsw = True
-        except ImportError:
-            self._has_hnsw = False
-            logger.warning("hnswlib 未安装，HNSWVectorStore 将降级为 SimpleVectorStore")
-    
-    def _init_index(self, dim: int):
-        """初始化 HNSW 索引"""
-        if not self._has_hnsw:
-            return
+            self.client = chromadb.PersistentClient(
+                path=self.persist_dir,
+                settings=Settings(
+                    anonymized_telemetry=False,
+                    allow_reset=True
+                )
+            )
             
-        self.dim = dim
-        # 创建索引（初始容量 10000，可动态增长）
-        self._index = self._hnswlib.Index(space=self.space, dim=dim)
-        self._index.init_index(
-            max_elements=10000,
-            ef_construction=self.ef_construction,
-            M=self.M
-        )
-        self._index.set_ef(self.ef)
-        logger.info(f"HNSW 索引已初始化: dim={dim}, space={self.space}, M={self.M}")
-    
-    def add(self, text: str, metadata: Dict[str, Any] = None):
-        """添加文档（不带嵌入，需要后续调用 add_with_embedding）"""
-        self.documents.append({
-            "text": text,
-            "metadata": metadata or {}
-        })
+            # 获取或创建集合
+            self.collection = self.client.get_or_create_collection(
+                name=self.collection_name,
+                metadata={"hnsw:space": distance_fn}
+            )
+            
+            logger.info(f"ChromaDB 已初始化: {self.persist_dir}, 集合: {self.collection_name}")
+        except Exception as e:
+            logger.error(f"ChromaDB 初始化失败: {e}")
+            raise RuntimeError(f"ChromaDB 初始化失败: {e}")
     
     def add_with_embedding(self, text: str, embedding: List[float], metadata: Dict[str, Any] = None):
         """添加带嵌入的文档"""
-        doc_id = self._id_counter
-        self._id_counter += 1
-        
-        # 保存文档
-        self.documents.append({
-            "id": doc_id,
-            "text": text,
-            "metadata": metadata or {}
-        })
-        
-        # 如果没有 HNSW，直接返回（降级为简单存储）
-        if not self._has_hnsw:
-            return
-        
-        # 延迟初始化索引
-        if self._index is None:
-            self._init_index(len(embedding))
-        
-        # 动态扩容
-        if doc_id >= self._index.get_max_elements():
-            new_size = self._index.get_max_elements() * 2
-            self._index.resize_index(new_size)
-            logger.debug(f"HNSW 索引扩容到 {new_size}")
-        
-        # 添加向量到索引
-        import numpy as np
-        vector = np.array(embedding, dtype=np.float32)
-        self._index.add_items(vector, doc_id)
+        try:
+            # 生成文档 ID（基于内容哈希）
+            import hashlib
+            doc_id = hashlib.md5(text[:100].encode()).hexdigest()
+            
+            # 准备元数据
+            meta = metadata or {}
+            meta['_text_preview'] = text[:200]  # 存储文本预览用于调试
+            
+            # 添加到 ChromaDB
+            self.collection.add(
+                ids=[doc_id],
+                embeddings=[embedding],
+                documents=[text],
+                metadatas=[meta]
+            )
+            
+            logger.debug(f"文档已添加: {doc_id}")
+        except Exception as e:
+            logger.error(f"添加文档失败: {e}")
     
     def search(self, query_embedding: List[float], top_k: int = 3) -> List[Dict[str, Any]]:
-        """相似度搜索（使用 HNSW，O(log n)）"""
-        if not self.documents:
+        """相似度搜索"""
+        try:
+            results = self.collection.query(
+                query_embeddings=[query_embedding],
+                n_results=top_k,
+                include=["documents", "metadatas", "distances"]
+            )
+            
+            # 转换结果格式
+            output = []
+            if results['ids'] and len(results['ids'][0]) > 0:
+                for i in range(len(results['ids'][0])):
+                    # ChromaDB 返回的是距离，转换为相似度
+                    distance = results['distances'][0][i]
+                    if self.distance_fn == 'cosine':
+                        similarity = 1.0 - distance
+                    else:
+                        similarity = 1.0 / (1.0 + distance)
+                    
+                    output.append({
+                        "text": results['documents'][0][i],
+                        "metadata": results['metadatas'][0][i],
+                        "similarity": similarity
+                    })
+            
+            return output
+        except Exception as e:
+            logger.error(f"搜索失败: {e}")
             return []
-        
-        # 如果没有 HNSW 或索引未初始化，降级为暴力搜索
-        if not self._has_hnsw or self._index is None:
-            return self._brute_force_search(query_embedding, top_k)
-        
-        # HNSW 搜索
-        import numpy as np
-        query_vec = np.array(query_embedding, dtype=np.float32)
-        
-        # 搜索最近邻
-        labels, distances = self._index.knn_query(query_vec, k=min(top_k, len(self.documents)))
-        
-        results = []
-        for i, (label, distance) in enumerate(zip(labels[0], distances[0])):
-            doc_idx = int(label)
-            if doc_idx < len(self.documents):
-                doc = self.documents[doc_idx]
-                # cosine 空间返回的是距离，转换为相似度
-                if self.space == 'cosine':
-                    similarity = 1.0 - float(distance)
-                else:
-                    similarity = 1.0 / (1.0 + float(distance))
-                
-                results.append({
-                    "text": doc["text"],
-                    "metadata": doc["metadata"],
-                    "similarity": similarity
-                })
-        
-        return results
     
-    def _brute_force_search(self, query_embedding: List[float], top_k: int = 3) -> List[Dict[str, Any]]:
-        """降级：暴力搜索"""
-        if not HAS_NUMPY or len(self.documents) == 0:
-            return []
-        
-        # 收集所有嵌入
-        embeddings = []
-        for doc in self.documents:
-            if 'embedding' in doc:
-                embeddings.append(doc['embedding'])
-        
-        if not embeddings:
-            return []
-        
-        query_vec = np.array(query_embedding)
-        doc_vecs = np.array(embeddings)
-        
-        # 归一化
-        query_vec = query_vec / (np.linalg.norm(query_vec) + 1e-8)
-        doc_vecs = doc_vecs / (np.linalg.norm(doc_vecs, axis=1, keepdims=True) + 1e-8)
-        
-        similarities = np.dot(doc_vecs, query_vec)
-        top_indices = np.argsort(similarities)[-top_k:][::-1]
-        
-        results = []
-        for idx in top_indices:
-            results.append({
-                "text": self.documents[idx]["text"],
-                "metadata": self.documents[idx]["metadata"],
-                "similarity": float(similarities[idx])
-            })
-        
-        return results
+    def delete_by_source(self, source: str):
+        """根据来源删除文档（用于增量更新）"""
+        try:
+            # 查询所有匹配的文档
+            results = self.collection.get(
+                where={"source": source},
+                include=[]
+            )
+            
+            if results['ids']:
+                self.collection.delete(ids=results['ids'])
+                logger.info(f"已删除 {len(results['ids'])} 个文档: {source}")
+        except Exception as e:
+            logger.error(f"删除文档失败: {e}")
+    
+    def get_document_hashes(self) -> Dict[str, str]:
+        """获取所有文档的哈希（用于增量更新检测）"""
+        try:
+            results = self.collection.get(include=["metadatas"])
+            hashes = {}
+            for i, doc_id in enumerate(results['ids']):
+                meta = results['metadatas'][i]
+                if 'file_hash' in meta:
+                    hashes[meta.get('source', doc_id)] = meta['file_hash']
+            return hashes
+        except Exception as e:
+            logger.error(f"获取文档哈希失败: {e}")
+            return {}
+    
+    def clear(self):
+        """清空集合"""
+        try:
+            self.client.delete_collection(self.collection_name)
+            self.collection = self.client.get_or_create_collection(
+                name=self.collection_name,
+                metadata={"hnsw:space": self.distance_fn}
+            )
+            logger.info(f"集合已清空: {self.collection_name}")
+        except Exception as e:
+            logger.error(f"清空集合失败: {e}")
     
     def get_stats(self) -> Dict[str, Any]:
         """获取统计信息"""
-        return {
-            "total_documents": len(self.documents),
-            "index_type": "HNSW" if (self._has_hnsw and self._index is not None) else "brute_force",
-            "space": self.space,
-            "dim": self.dim,
-            "ef": self.ef,
-            "M": self.M
-        }
+        try:
+            count = self.collection.count()
+            return {
+                "total_documents": count,
+                "index_type": "chroma",
+                "persist_dir": self.persist_dir,
+                "collection": self.collection_name,
+                "distance_fn": self.distance_fn
+            }
+        except Exception as e:
+            logger.error(f"获取统计失败: {e}")
+            return {"total_documents": 0, "index_type": "chroma_error"}
 
 
 class KnowledgeBaseService:
-    """知识库服务"""
+    """知识库服务（基于 ChromaDB）"""
     
     def __init__(self, data_dir: str = None, embedding_model: str = None, embedding_host: str = None,
-                 use_hnsw: bool = None):
+                 chroma_dir: str = None):
         self.data_dir = Path(data_dir or os.environ.get("KB_DATA_DIR", "./knowledge_base/data"))
         self.data_dir.mkdir(parents=True, exist_ok=True)
         
@@ -337,25 +271,16 @@ class KnowledgeBaseService:
         self.embedding_model = embedding_model or os.environ.get("KB_EMBEDDING_MODEL", "nomic-embed-text")
         self.embedding_host = embedding_host or os.environ.get("KB_EMBEDDING_HOST", "http://localhost:11434")
         
-        # 是否使用 HNSW（默认启用）
-        if use_hnsw is None:
-            use_hnsw = os.environ.get("KB_USE_HNSW", "true").lower() in ("true", "1", "yes")
-        
         # 初始化组件
         self.embedder = SimpleEmbedding(model=self.embedding_model, host=self.embedding_host)
         
-        # 选择向量存储后端
-        if use_hnsw:
-            logger.info("使用 HNSW 向量存储（高效近似最近邻）")
-            self.vector_store = HNSWVectorStore(
-                space='cosine',
-                ef_construction=int(os.environ.get("KB_HNSW_EF_CONSTRUCTION", "200")),
-                M=int(os.environ.get("KB_HNSW_M", "16")),
-                ef=int(os.environ.get("KB_HNSW_EF", "50"))
-            )
-        else:
-            logger.info("使用简单向量存储（暴力搜索）")
-            self.vector_store = SimpleVectorStore()
+        # 使用 ChromaDB 向量存储（强制持久化）
+        logger.info("使用 ChromaDB 向量存储（自动持久化 + HNSW）")
+        self.vector_store = ChromaVectorStore(
+            persist_dir=chroma_dir or os.environ.get("KB_CHROMA_DIR"),
+            collection_name="knowledge_base",
+            distance_fn="cosine"
+        )
         
         logger.info(f"使用嵌入模型: {self.embedding_model} @ {self.embedding_host}")
         
@@ -416,30 +341,84 @@ class KnowledgeBaseService:
                 except Exception as e:
                     logger.warning(f"加载文档失败 {file}: {e}")
         
-        logger.info(f"共加载 {len(self.vector_store.documents)} 个文档")
+        # 获取文档数量
+        if hasattr(self.vector_store, 'get_stats'):
+            doc_count = self.vector_store.get_stats().get("total_documents", 0)
+        else:
+            doc_count = len(getattr(self.vector_store, 'documents', []))
+        logger.info(f"共加载 {doc_count} 个文档")
     
     def reload(self):
-        """重新加载知识库（用于更新后刷新）"""
-        logger.info("重新加载知识库...")
+        """重新加载知识库（增量更新）"""
+        logger.info("重新加载知识库（增量更新）...")
         
-        # 清空现有数据（保留原有存储类型）
-        if isinstance(self.vector_store, HNSWVectorStore):
-            self.vector_store = HNSWVectorStore(
-                space='cosine',
-                ef_construction=self.vector_store.ef_construction,
-                M=self.vector_store.M,
-                ef=self.vector_store.ef
-            )
-        else:
-            self.vector_store = SimpleVectorStore()
-        
-        # 重新加载
-        self._load_local_knowledge()
-        
+        # 执行增量加载
+        stats = self._incremental_load()
         return {
             "status": "success",
-            "documents": len(self.vector_store.documents)
+            "mode": "incremental",
+            "stats": stats
         }
+    
+    def _incremental_load(self) -> Dict[str, Any]:
+        """增量加载：只处理新增或修改的文件"""
+        import hashlib
+        
+        kb_base = Path(__file__).parent
+        stats = {"added": 0, "updated": 0, "unchanged": 0, "failed": 0}
+        
+        # 获取已存储的文件哈希
+        stored_hashes = self.vector_store.get_document_hashes()
+        
+        # 扫描所有文件
+        all_dirs = [
+            (kb_base / "chips", "chip_doc"),
+            (kb_base / "best_practices", "best_practice")
+        ]
+        
+        for dir_path, doc_type in all_dirs:
+            if not dir_path.exists():
+                continue
+                
+            for file in dir_path.glob("*.md"):
+                try:
+                    content = file.read_text(encoding='utf-8')
+                    file_hash = hashlib.md5(content.encode()).hexdigest()
+                    file_key = str(file)
+                    
+                    # 检查是否需要更新
+                    if file_key in stored_hashes:
+                        if stored_hashes[file_key] == file_hash:
+                            stats["unchanged"] += 1
+                            continue
+                        else:
+                            # 删除旧版本
+                            self.vector_store.delete_by_source(file_key)
+                            stats["updated"] += 1
+                    else:
+                        stats["added"] += 1
+                    
+                    # 添加新版本
+                    embedding = self.embedder.embed(content[:1000])
+                    self.vector_store.add_with_embedding(
+                        content,
+                        embedding,
+                        {
+                            "source": file_key,
+                            "type": doc_type,
+                            "file_hash": file_hash,
+                            "filename": file.name
+                        }
+                    )
+                    logger.info(f"已加载: {file.name}")
+                    
+                except Exception as e:
+                    stats["failed"] += 1
+                    logger.warning(f"加载失败 {file}: {e}")
+        
+        total = sum(stats.values()) - stats["unchanged"]
+        logger.info(f"增量加载完成: 新增 {stats['added']}, 更新 {stats['updated']}, 失败 {stats['failed']}")
+        return stats
     
     def query(self, query_text: str, top_k: int = 3, generate_answer: bool = False) -> Dict[str, Any]:
         """查询知识库"""
@@ -466,12 +445,7 @@ class KnowledgeBaseService:
         }
         
         # 添加向量存储信息
-        if hasattr(self.vector_store, 'get_stats'):
-            response["vector_store"] = self.vector_store.get_stats()
-        elif isinstance(self.vector_store, HNSWVectorStore):
-            response["vector_store"] = {"index_type": "HNSW"}
-        else:
-            response["vector_store"] = {"index_type": "simple"}
+        response["vector_store"] = self.vector_store.get_stats()
         
         if generate_answer and results:
             # 简单答案生成（实际项目中可以使用 LLM）
@@ -504,18 +478,14 @@ class KnowledgeBaseService:
     def get_stats(self) -> Dict[str, Any]:
         """获取统计信息"""
         stats = {
-            "total_documents": len(self.vector_store.documents),
             "embedding_model": self.embedder.model,
             "data_dir": str(self.data_dir)
         }
         
-        # 添加存储后端信息
-        if hasattr(self.vector_store, 'get_stats'):
-            stats["vector_store"] = self.vector_store.get_stats()
-        elif isinstance(self.vector_store, HNSWVectorStore):
-            stats["vector_store"] = {"type": "HNSW"}
-        else:
-            stats["vector_store"] = {"type": "simple"}
+        # 添加 ChromaDB 存储信息
+        vs_stats = self.vector_store.get_stats()
+        stats["vector_store"] = vs_stats
+        stats["total_documents"] = vs_stats.get("total_documents", 0)
         
         return stats
 

@@ -258,15 +258,8 @@ show_kb_status() {
         echo "    服务地址: ${CYAN}${kb_url}${NC}"
         echo "    文档数量: ${BOLD}${doc_count}${NC}"
         echo "    嵌入模型: ${CYAN}${model}${NC}"
+        echo "    向量存储: ${GREEN}ChromaDB${NC} (持久化 + HNSW)"
         
-        # 显示向量存储后端类型
-        if [ "$index_type" != "unknown" ]; then
-            if [ "$index_type" = "HNSW" ]; then
-                echo "    向量存储: ${GREEN}HNSW${NC} (高效近似最近邻)"
-            else
-                echo "    向量存储: ${YELLOW}${index_type}${NC} (暴力搜索)"
-            fi
-        fi
         # 显示维度信息
         if [ "$dim" != "unknown" ] && [ "$dim" != "None" ]; then
             echo "    向量维度: ${dim}"
@@ -279,6 +272,7 @@ show_kb_status() {
             echo "    KB_EMBEDDING_MODEL: ${KB_EMBEDDING_MODEL:-'(使用默认: nomic-embed-text)'}"
             echo "    KB_EMBEDDING_HOST: ${KB_EMBEDDING_HOST:-'(使用默认: http://localhost:11434)'}"
             echo "    KB_DATA_DIR: ${KB_DATA_DIR:-'(使用默认: ./knowledge_base/data)'}"
+            echo "    KB_CHROMA_DIR: ${KB_CHROMA_DIR:-'(使用默认: ./knowledge_base/chroma_db)'}"
             # 根据模型显示预期维度
             case "${KB_EMBEDDING_MODEL:-nomic-embed-text}" in
                 nomic-embed-text*) echo "    向量维度: 768 (预期)" ;;

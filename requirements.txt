@@ -19,10 +19,8 @@ pathlib>=1.0.1
 # openclaw-cli  # 如果 OpenClaw 有 pip 包
 
 # Phase 3: Knowledge Base
-# chromadb>=0.4.0
-# sentence-transformers>=2.2.2
-# numpy==1.26.4  # 固定在 1.26.4 避免兼容性问题
-hnswlib>=0.8.0  # HNSW 向量检索加速
+chromadb>=0.5.0  # 向量数据库，内置 HNSW 和持久化
+numpy>=1.24.0
 
 # Phase 4: Code Executor
 # 使用本地 Ollama，无需额外依赖
@@ -40,5 +38,4 @@ pytest-cov>=4.1.0
 # Development
 black>=23.0.0
 flake8>=6.0.0
-numpy>=1.24.0
 psutil>=5.9.0
