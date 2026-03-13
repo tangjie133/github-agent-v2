@@ -267,10 +267,21 @@ class GitHubRepoWatcher:
             
             # 检查是否需要更新
             if not force and file_sha == sync_state.get(file_path):
-                logger.info(f"  [{i}/{len(files)}] ⏭️  跳过（已同步）: {file_path}")
-                stats['skipped'] += 1
-                stats['details'].append({'file': file_path, 'status': 'skipped'})
-                continue
+                # SHA 匹配，检查本地文件是否真的存在
+                target_name = Path(file_path).stem + ".md"
+                if "chip" in file_path.lower() or "芯片" in file_path:
+                    local_path = KB_CHIPS_DIR / target_name
+                else:
+                    local_path = KB_PRACTICES_DIR / target_name
+                
+                if local_path.exists():
+                    logger.info(f"  [{i}/{len(files)}] ⏭️  跳过（已同步）: {file_path}")
+                    stats['skipped'] += 1
+                    stats['details'].append({'file': file_path, 'status': 'skipped'})
+                    continue
+                else:
+                    # SHA 匹配但文件不存在，可能是被删除了，重新下载
+                    logger.info(f"  [{i}/{len(files)}] 📝 重新下载（本地缺失）: {file_path}")
             
             status_icon = "🆕" if file_path not in sync_state else "📝"
             logger.info(f"  [{i}/{len(files)}] {status_icon} 处理中: {file_path}")

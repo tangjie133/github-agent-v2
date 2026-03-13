@@ -95,6 +95,12 @@ show_banner() {
 check_dependencies() {
     step "步骤 1/6: 检查环境依赖"
     
+    if is_debug; then
+        debug "项目目录: $PROJECT_DIR"
+        debug "虚拟环境: $VENV_DIR"
+        debug "PATH: $PATH"
+    fi
+    
     # 检查 Python
     if ! command -v python3 &> /dev/null; then
         error "Python3 未安装"
@@ -111,6 +117,10 @@ check_dependencies() {
         success "虚拟环境创建完成"
     else
         info "虚拟环境: ${BOLD}$VENV_DIR${NC}"
+        if is_debug; then
+            debug "Python 路径: $(which python3)"
+            debug "Pip 版本: $(pip --version)"
+        fi
     fi
     
     # 激活虚拟环境
@@ -119,12 +129,20 @@ check_dependencies() {
     # 检查并安装依赖
     if [ ! -f "$VENV_DIR/.dependencies_installed" ] || [ "$PROJECT_DIR/requirements.txt" -nt "$VENV_DIR/.dependencies_installed" ]; then
         info "安装/更新依赖..."
-        pip install -q --upgrade pip
-        pip install -q -r "$PROJECT_DIR/requirements.txt"
+        if is_debug; then
+            pip install --upgrade pip 2>&1 | head -5
+            pip install -r "$PROJECT_DIR/requirements.txt" 2>&1 | tail -10
+        else
+            pip install -q --upgrade pip
+            pip install -q -r "$PROJECT_DIR/requirements.txt"
+        fi
         touch "$VENV_DIR/.dependencies_installed"
         success "依赖安装完成"
     else
         success "依赖已安装"
+        if is_debug; then
+            debug "依赖检查跳过（已安装且未过期）"
+        fi
     fi
     
     # 检查 Ollama
@@ -132,8 +150,16 @@ check_dependencies() {
     if curl -s "$OLLAMA_HOST/api/tags" > /dev/null 2>&1; then
         OLLAMA_MODELS=$(curl -s "$OLLAMA_HOST/api/tags" | python3 -c "import sys,json; d=json.load(sys.stdin); print(', '.join([m['name'] for m in d.get('models',[])][:3]))" 2>/dev/null || echo "unknown")
         success "Ollama 服务正常 (${OLLAMA_MODELS})"
+        if is_debug; then
+            debug "Ollama 地址: $OLLAMA_HOST"
+            debug "可用模型:"
+            curl -s "$OLLAMA_HOST/api/tags" | python3 -c "import sys,json; [print(f'  - {m[\"name\"]}') for m in json.load(sys.stdin).get('models',[])]" 2>/dev/null || true
+        fi
     else
         warning "Ollama 服务未启动 (${OLLAMA_HOST})"
+        if is_debug; then
+            debug "检查命令: curl -s $OLLAMA_HOST/api/tags"
+        fi
     fi
     
     echo ""
@@ -142,6 +168,13 @@ check_dependencies() {
 # 检查环境变量
 check_env() {
     step "步骤 2/6: 检查配置"
+    
+    if is_debug; then
+        debug "检查环境变量..."
+        debug "GITHUB_APP_ID: ${GITHUB_APP_ID:-'(未设置)'}"
+        debug "GITHUB_PRIVATE_KEY_PATH: ${GITHUB_PRIVATE_KEY_PATH:-'(未设置)'}"
+        debug "GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:0:3}***"
+    fi
     
     local missing=()
     
@@ -178,6 +211,15 @@ check_env() {
     echo "    评论: ${GITHUB_AGENT_COMMENT_TRIGGER_MODE:-smart}"
     echo "    确认模式: ${AGENT_CONFIRM_MODE:-auto}"
     
+    if is_debug; then
+        echo ""
+        echo "  ${BOLD}DEBUG 配置:${NC}"
+        echo "    LOG_LEVEL: ${LOG_LEVEL}"
+        echo "    KB_SERVICE_URL: ${KB_SERVICE_URL}"
+        echo "    OLLAMA_HOST: ${OLLAMA_HOST}"
+        echo "    WORKDIR: ${GITHUB_AGENT_WORKDIR:-/tmp/github-agent-v2}"
+    fi
+    
     # 代理状态
     if [ -n "$http_proxy" ]; then
         echo ""
@@ -193,6 +235,11 @@ check_env() {
 # 显示知识库状态
 show_kb_status() {
     local kb_url="${KB_SERVICE_URL:-http://localhost:8000}"
+    
+    if is_debug; then
+        debug "检查知识库服务: $kb_url"
+        debug "健康检查: curl -s $kb_url/health"
+    fi
     
     if curl -s "$kb_url/health" > /dev/null 2>&1; then
         local stats=$(curl -s "$kb_url/stats" 2>/dev/null)
@@ -242,6 +289,13 @@ start_kb_service() {
     KB_PORT="${KB_SERVICE_PORT:-8000}"
     # 服务连接配置（用于检查连接）
     KB_URL="${KB_SERVICE_URL:-http://$KB_HOST:$KB_PORT}"
+    
+    if is_debug; then
+        debug "KB_SERVICE_HOST: $KB_HOST"
+        debug "KB_SERVICE_PORT: $KB_PORT"
+        debug "KB_SERVICE_URL: $KB_URL"
+        debug "检查命令: curl -s $KB_URL/health"
+    fi
     
     # 检查是否已有 KB Service 在运行
     if curl -s "$KB_URL/health" > /dev/null 2>&1; then
@@ -331,10 +385,15 @@ sync_github_kb_if_enabled() {
     
     if ! is_github_kb_enabled; then
         info "GitHub 知识库同步未启用"
-        echo ""
-        echo "  ${BOLD}启用方式:${NC}"
-        echo "    设置 ${CYAN}KB_GITHUB_SYNC_ENABLED=true${NC} 以启用"
-        echo "    设置 ${CYAN}KB_REPO=owner/repo${NC} 指定仓库"
+        if is_debug; then
+            echo ""
+            echo "  ${BOLD}当前配置:${NC}"
+            echo "    KB_GITHUB_SYNC_ENABLED: ${KB_GITHUB_SYNC_ENABLED:-'(未设置)'}"
+            echo ""
+            echo "  ${BOLD}启用方式:${NC}"
+            echo "    设置 ${CYAN}KB_GITHUB_SYNC_ENABLED=true${NC} 以启用"
+            echo "    设置 ${CYAN}KB_REPO=owner/repo${NC} 指定仓库"
+        fi
         echo ""
         return 0
     fi
@@ -350,6 +409,10 @@ sync_github_kb_if_enabled() {
     echo "    仓库: ${CYAN}${repo}${NC}"
     echo "    分支: ${CYAN}${branch}${NC}"
     [ -n "$http_proxy" ] && echo "    代理: ${CYAN}${http_proxy}${NC}"
+    if is_debug; then
+        echo "    GITHUB_TOKEN: $([ -n "$GITHUB_TOKEN" ] && echo '${GREEN}已设置${NC}' || echo '${RED}未设置${NC}')"
+        echo "    同步命令: ${CYAN}python3 scripts/github_repo_watcher.py --sync${NC}"
+    fi
     echo ""
     
     cd "$PROJECT_DIR"
@@ -358,7 +421,16 @@ sync_github_kb_if_enabled() {
     info "开始同步..."
     echo ""
     
-    if python3 scripts/github_repo_watcher.py --sync; then
+    # 根据日志级别调整 Python 日志
+    if is_debug; then
+        LOG_LEVEL=DEBUG python3 scripts/github_repo_watcher.py --sync
+    else
+        python3 scripts/github_repo_watcher.py --sync 2>&1 | grep -E '(🔄|📋|📊|✅|❌|✓)' || true
+    fi
+    
+    local sync_status=$?
+    
+    if [ $sync_status -eq 0 ]; then
         success "同步完成"
         
         # 显示本地知识库统计
@@ -369,15 +441,27 @@ sync_github_kb_if_enabled() {
         echo "  ${BOLD}本地知识库统计:${NC}"
         echo "    Markdown 文件: ${BOLD}${md_count}${NC}"
         [ "$pdf_count" -gt 0 ] && echo "    PDF 文件: ${BOLD}${pdf_count}${NC}"
+        if is_debug; then
+            echo ""
+            echo "  ${BOLD}本地文件列表:${NC}"
+            find knowledge_base/chips knowledge_base/best_practices -name "*.md" 2>/dev/null | head -10 | while read f; do
+                echo "    • $(basename "$f")"
+            done
+        fi
         echo ""
     else
         warning "同步失败或部分失败"
-        echo ""
-        echo "  ${BOLD}建议操作:${NC}"
-        echo "    1. 检查网络连接和代理设置"
-        echo "    2. 验证 GITHUB_TOKEN 是否有效"
-        echo "    3. 手动执行同步查看详细错误:"
-        echo "       ${CYAN}python3 scripts/github_repo_watcher.py --sync${NC}"
+        if is_debug; then
+            echo ""
+            echo "  ${BOLD}排查步骤:${NC}"
+            echo "    1. 检查网络: ${CYAN}curl -I https://api.github.com${NC}"
+            echo "    2. 检查代理: ${CYAN}echo \$HTTP_PROXY${NC}"
+            echo "    3. 检查 Token: ${CYAN}python3 -c \"import os; print('OK' if os.getenv('GITHUB_TOKEN') else 'MISSING')\"${NC}"
+            echo "    4. 手动调试: ${CYAN}LOG_LEVEL=DEBUG python3 scripts/github_repo_watcher.py --sync${NC}"
+        else
+            echo ""
+            echo "  使用 ${CYAN}LOG_LEVEL=DEBUG ./scripts/start.sh${NC} 查看详细错误"
+        fi
         echo ""
         info "将继续启动，知识库可能不完整"
     fi
@@ -401,6 +485,13 @@ start_github_kb_daemon_if_enabled() {
     local kb_repo="${KB_REPO:-tangjie133/knowledge-base}"
     
     step "步骤 5/6: 启动后台监控"
+    
+    if is_debug; then
+        debug "KB_GITHUB_SYNC_ENABLED: ${KB_GITHUB_SYNC_ENABLED}"
+        debug "KB_SYNC_INTERVAL: ${sync_interval}"
+        debug "KB_WEBHOOK_ENABLED: ${webhook_enabled}"
+        debug "KB_REPO: ${kb_repo}"
+    fi
     
     local daemon_count=0
     
