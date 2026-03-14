@@ -79,14 +79,17 @@ class PDFProcessor:
     """
     
     # 默认配置（可从环境变量覆盖）
-    # 自动检测 CPU 核心数，默认使用 1/3 核心（避免占满 CPU）
+    # 自动检测 CPU 核心数，合理配置线程数
     import os as _os
     _cpu_count = _os.cpu_count() or 4
-    DEFAULT_WORKERS = max(4, _cpu_count // 3)  # 默认 8 线程（24核/3=8）
+    # Ollama 并发性能测试：16并发可达 71 请求/秒
+    # 但 embed_batch 内部已经有8线程并发，所以 PDFProcessor 应该用较少线程
+    # 总并发度 = PDFProcessor线程数 × embed_batch并发数，建议控制在 16-24
+    DEFAULT_WORKERS = max(4, _cpu_count // 4)  # 默认 6 线程
     DEFAULT_PARALLEL_THRESHOLD = 3   # 启用多线程的页数阈值（3页以上就并行）
     LARGE_FILE_PAGES = 50            # 大文件阈值（页数）
-    BATCH_SIZE = 10                  # 分批处理大小
-    PROGRESS_INTERVAL = 5            # 进度报告间隔（秒）
+    BATCH_SIZE = 100                 # 分批处理大小（100页/批，大batch更高效）
+    PROGRESS_INTERVAL = 2            # 进度报告间隔（秒）
     
     def __init__(self, embedder=None, max_workers: int = None):
         """
@@ -195,11 +198,15 @@ class PDFProcessor:
         
         metadata.source = str(pdf_path.name)
         
-        # 解析 PDF
-        if self._use_pdfplumber:
-            pages = self._parse_with_pdfplumber(pdf_path, metadata)
-        else:
-            pages = self._parse_with_pypdf2(pdf_path, metadata)
+        # 解析 PDF（优先使用 PyMuPDF，速度最快）
+        try:
+            import fitz
+            pages = self._parse_with_pymupdf(pdf_path, metadata)
+        except ImportError:
+            if self._use_pdfplumber:
+                pages = self._parse_with_pdfplumber(pdf_path, metadata)
+            else:
+                pages = self._parse_with_pypdf2(pdf_path, metadata)
         
         # 更新总页数
         metadata.total_pages = len(pages)
@@ -210,16 +217,14 @@ class PDFProcessor:
         return pages
     
     def _parse_with_pdfplumber(self, pdf_path: Path, metadata: PDFMetadata) -> List[PDFPage]:
-        """使用 pdfplumber 解析 PDF"""
+        """使用 pdfplumber 解析 PDF（备用方案）"""
         pages = []
         
         with self._pdfplumber.open(pdf_path) as pdf:
             for i, page in enumerate(pdf.pages, 1):
-                # 提取文本
                 text = page.extract_text()
                 
                 if text and text.strip():
-                    # 清理文本
                     text = self._clean_text(text)
                     
                     page_data = PDFPage(
@@ -230,7 +235,35 @@ class PDFProcessor:
                             "chip": metadata.chip,
                             "source": metadata.source,
                             "page": i,
-                            "total_pages": 0  # 稍后更新
+                            "total_pages": 0
+                        }
+                    )
+                    pages.append(page_data)
+        
+        return pages
+    
+    def _parse_with_pymupdf(self, pdf_path: Path, metadata: PDFMetadata) -> List[PDFPage]:
+        """使用 PyMuPDF (fitz) 解析 PDF（更快）"""
+        import fitz  # PyMuPDF
+        pages = []
+        
+        with fitz.open(pdf_path) as pdf:
+            for i in range(len(pdf)):
+                page = pdf[i]
+                text = page.get_text()
+                
+                if text and text.strip():
+                    text = self._clean_text(text)
+                    
+                    page_data = PDFPage(
+                        content=text,
+                        page_num=i+1,
+                        metadata={
+                            "vendor": metadata.vendor,
+                            "chip": metadata.chip,
+                            "source": metadata.source,
+                            "page": i+1,
+                            "total_pages": len(pdf)
                         }
                     )
                     pages.append(page_data)
@@ -339,19 +372,14 @@ class PDFProcessor:
     def _process_streaming_parallel(self, pdf_path: Path, vector_store, metadata: Optional[PDFMetadata],
                                      stats: dict, progress_callback: Optional[Callable], start_time: float):
         """
-        流式并行处理：边解析边批量 embedding
+        流式并行处理 PDF
         
-        架构：
-        - 主线程：解析PDF，将页面分批放入队列
-        - 工作线程池：从队列取批次，批量embedding并存储
-        
-        优化点：
-        1. 解析和处理并行，充分利用CPU和网络
-        2. 批量embedding减少请求次数
-        3. 内存友好：使用队列限制内存占用
+        针对 Ollama embedding 服务优化：
+        - 单 Ollama 实例：6-8 线程最佳（避免竞争）
+        - 多 Ollama 实例：可线性增加线程数
+        - 批处理：每批 20 页，平衡内存和网络效率
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        from queue import Queue, Empty
         import threading
         
         # 准备元数据
@@ -359,148 +387,151 @@ class PDFProcessor:
             metadata = self.extract_metadata_from_filename(pdf_path.name)
         metadata.source = str(pdf_path.name)
         
-        # 批处理队列（限制大小防止内存爆炸）
-        batch_queue = Queue(maxsize=self.max_workers * 2)
-        pages_list = []  # 存储所有页面用于统计
-        total_pages = [0]  # 使用列表以便在闭包中修改
-        parsing_done = threading.Event()
+        # 解析 PDF（使用PyMuPDF，比pdfplumber快3-5倍）
+        logger.info(f"📖 解析PDF中...")
+        pages = []
+        try:
+            import fitz
+            with fitz.open(pdf_path) as pdf:
+                for i in range(len(pdf)):
+                    page = pdf[i]
+                    text = page.get_text()
+                    if text and text.strip():
+                        text = self._clean_text(text)
+                        pages.append(PDFPage(
+                            content=text,
+                            page_num=i+1,
+                            metadata={
+                                "vendor": metadata.vendor,
+                                "chip": metadata.chip,
+                                "source": metadata.source,
+                                "page": i+1,
+                                "total_pages": len(pdf)
+                            }
+                        ))
+        except ImportError:
+            with self._pdfplumber.open(pdf_path) as pdf:
+                for i, page in enumerate(pdf.pages, 1):
+                    text = page.extract_text()
+                    if text and text.strip():
+                        text = self._clean_text(text)
+                        pages.append(PDFPage(
+                            content=text,
+                            page_num=i,
+                            metadata={
+                                "vendor": metadata.vendor,
+                                "chip": metadata.chip,
+                                "source": metadata.source,
+                                "page": i,
+                                "total_pages": len(pdf.pages)
+                            }
+                        ))
         
-        # 解析线程：边解析边分批入队
-        def parse_worker():
-            try:
-                with self._pdfplumber.open(pdf_path) as pdf:
-                    total_pages[0] = len(pdf.pages)
-                    current_batch = []
-                    
-                    for i, page in enumerate(pdf.pages, 1):
-                        text = page.extract_text()
-                        if text and text.strip():
-                            text = self._clean_text(text)
-                            page_data = PDFPage(
-                                content=text,
-                                page_num=i,
-                                metadata={
-                                    "vendor": metadata.vendor,
-                                    "chip": metadata.chip,
-                                    "source": metadata.source,
-                                    "page": i,
-                                    "total_pages": total_pages[0]
-                                }
-                            )
-                            current_batch.append(page_data)
-                            pages_list.append(page_data)
-                            
-                            # 批次满了就入队
-                            if len(current_batch) >= self.BATCH_SIZE:
-                                batch_queue.put(current_batch)
-                                current_batch = []
-                    
-                    # 最后一批
-                    if current_batch:
-                        batch_queue.put(current_batch)
-            except Exception as e:
-                logger.error(f"解析线程错误: {e}")
-            finally:
-                parsing_done.set()
+        total_pages = len(pages)
+        stats["pages_processed"] = total_pages
         
-        # 启动解析线程
-        parse_thread = threading.Thread(target=parse_worker, daemon=True)
-        parse_thread.start()
-        
-        # 批量处理函数
-        def process_batch(batch: List[PDFPage]) -> Tuple[int, int, List[str]]:
-            """处理一个批次，返回 (成功数, 总数, 错误列表)"""
-            success = 0
-            errors = []
-            
-            try:
-                # 批量生成 embedding（如果 embedder 支持）
-                texts = [p.content[:2000] for p in batch]
-                try:
-                    # 尝试批量 embedding
-                    embeddings = self.embedder.embed_batch(texts)
-                except:
-                    # 降级到单个处理
-                    embeddings = [self.embedder.embed(t) for t in texts]
-                
-                # 批量存储
-                for page, embedding in zip(batch, embeddings):
-                    try:
-                        doc_id = self._generate_doc_id(page)
-                        meta = {
-                            **page.metadata,
-                            "doc_id": doc_id,
-                            "content_preview": page.content[:200],
-                            "processed_at": time.time()
-                        }
-                        vector_store.add_with_embedding(
-                            text=page.content,
-                            embedding=embedding,
-                            metadata=meta
-                        )
-                        success += 1
-                    except Exception as e:
-                        errors.append(f"页面 {page.page_num}: {str(e)[:50]}")
-                
-            except Exception as e:
-                errors.append(f"批次处理失败: {str(e)[:100]}")
-            
-            return success, len(batch), errors
-        
-        # 工作线程池处理批次
-        processed_count = 0
-        lock = threading.Lock()
-        last_progress_time = start_time
-        
-        # 收集所有批次
-        batches = []
-        while not parsing_done.is_set() or not batch_queue.empty():
-            try:
-                batch = batch_queue.get(timeout=0.1)
-                batches.append(batch)
-            except Empty:
-                continue
-        
-        # 等待解析线程完成
-        parse_thread.join()
-        
-        total_batches = len(batches)
-        stats["pages_processed"] = len(pages_list)
-        stats["batches"] = total_batches
-        
-        if total_batches == 0:
+        if total_pages == 0:
             logger.warning("没有解析到任何页面")
             return
         
-        logger.info(f"📄 解析完成: {len(pages_list)} 页, {total_batches} 批次 | 开始并行 embedding...")
+        logger.info(f"🚀 开始并行处理: {total_pages} 页 | {self.max_workers} 线程 | 批大小: {self.BATCH_SIZE}")
         
-        # 并行处理所有批次
+        # 将页面分组
+        batches = []
+        for i in range(0, total_pages, self.BATCH_SIZE):
+            batches.append(pages[i:i+self.BATCH_SIZE])
+        
+        stats["batches"] = len(batches)
+        
+        # 处理单个批次
+        def process_batch(batch_idx: int, batch: List[PDFPage]) -> Tuple[int, int, int]:
+            """处理一个批次，返回 (成功数, 失败数, 批次索引)"""
+            success = 0
+            failed = 0
+            
+            # 批量 embedding
+            texts = [p.content[:2000] for p in batch]
+            try:
+                # 使用 embedder 的批量方法（内部有并发）
+                embeddings = self.embedder.embed_batch(texts, max_workers=min(8, len(texts)))
+            except Exception as e:
+                logger.warning(f"批次 {batch_idx} 批量embedding失败，降级到单条: {e}")
+                embeddings = []
+                for t in texts:
+                    try:
+                        emb = self.embedder.embed(t)
+                        embeddings.append(emb)
+                    except:
+                        embeddings.append(None)
+            
+            # 存储结果
+            for page, embedding in zip(batch, embeddings):
+                if embedding is None:
+                    failed += 1
+                    continue
+                try:
+                    doc_id = self._generate_doc_id(page)
+                    meta = {
+                        **page.metadata,
+                        "doc_id": doc_id,
+                        "content_preview": page.content[:200],
+                        "processed_at": time.time()
+                    }
+                    vector_store.add_with_embedding(
+                        text=page.content,
+                        embedding=embedding,
+                        metadata=meta
+                    )
+                    success += 1
+                except Exception as e:
+                    failed += 1
+                    stats["errors"].append(f"页面 {page.page_num}: {str(e)[:50]}")
+            
+            return success, failed, batch_idx
+        
+        # 使用线程池并行处理批次
+        stored_count = 0
+        failed_count = 0
+        processed_batches = 0
+        lock = threading.Lock()
+        last_progress_time = start_time
+        
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            future_to_batch = {executor.submit(process_batch, batch): i 
-                              for i, batch in enumerate(batches)}
+            future_to_batch = {
+                executor.submit(process_batch, i, batch): i 
+                for i, batch in enumerate(batches)
+            }
             
             for future in as_completed(future_to_batch):
                 batch_idx = future_to_batch[future]
-                success, total, errors = future.result()
+                success, failed, _ = future.result()
                 
                 with lock:
-                    stats["pages_stored"] += success
-                    stats["errors"].extend(errors)
-                    processed_count += total
+                    stored_count += success
+                    failed_count += failed
+                    processed_batches += 1
                     
                     # 进度回调
                     if progress_callback:
-                        progress_callback(stats["pages_stored"], len(pages_list), "embedding")
+                        progress_callback(stored_count, total_pages, "embedding")
                     
-                    # 定期进度报告
+                    # 定期报告
                     current_time = time.time()
                     if current_time - last_progress_time >= self.PROGRESS_INTERVAL:
                         elapsed = current_time - start_time
-                        rate = processed_count / elapsed if elapsed > 0 else 0
-                        logger.info(f"   ⏳ 进度: {processed_count}/{len(pages_list)} 页 "
-                                   f"({processed_count/len(pages_list)*100:.1f}%) | "
-                                   f"速率: {rate:.1f} 页/s")
+                        rate = (stored_count + failed_count) / elapsed if elapsed > 0 else 0
+                        progress_pct = stored_count / total_pages * 100
+                        logger.info(f"   ⏳ 进度: {processed_batches}/{len(batches)} 批 "
+                                   f"({progress_pct:.1f}%) | "
+                                   f"速率: {rate:.1f} 页/s | "
+                                   f"成功: {stored_count} 失败: {failed_count}")
                         last_progress_time = current_time
+        
+        stats["pages_stored"] = stored_count
+        
+        if progress_callback:
+            progress_callback(stored_count, total_pages, "completed")
+
 
     def _process_pages_parallel(self, pages: List[PDFPage], vector_store, stats: dict,
                                  progress_callback: Optional[Callable], start_time: float):

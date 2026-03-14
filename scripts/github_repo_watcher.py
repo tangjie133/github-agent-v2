@@ -36,6 +36,15 @@ import logging
 # 添加项目路径
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+# 加载 .env 文件
+try:
+    from dotenv import load_dotenv
+    env_path = Path(__file__).parent.parent / ".env"
+    if env_path.exists():
+        load_dotenv(env_path)
+except ImportError:
+    pass  # python-dotenv 未安装，依赖环境变量
+
 # 抑制第三方库的 DEBUG 日志
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("requests").setLevel(logging.WARNING)
@@ -495,9 +504,9 @@ class GitHubRepoWatcher:
         # 加载同步状态
         sync_state = self._load_sync_state()
         
-        # 创建临时下载目录
-        temp_dir = Path("/tmp/github_kb_sync")
-        temp_dir.mkdir(exist_ok=True)
+        # 创建临时下载目录（使用环境变量配置）
+        temp_dir = Path(os.environ.get("GITHUB_AGENT_WORKDIR", "/tmp")) / "github_kb_sync"
+        temp_dir.mkdir(parents=True, exist_ok=True)
         
         # 统计信息
         stats = {

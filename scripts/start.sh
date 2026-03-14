@@ -392,11 +392,12 @@ start_kb_service() {
     cd "$PROJECT_DIR"
     
     # 使用 setsid 创建新的会话，确保进程在后台持续运行
-    # 传递嵌入模型配置
+    # 传递嵌入模型配置和 ChromaDB 目录
     setsid python3 -m knowledge_base.kb_service \
         --host "$KB_HOST" \
         --port "$KB_PORT" \
-        --embedding-model "${EMBED_MODEL}" > /tmp/kb_service.log 2>&1 &
+        --embedding-model "${EMBED_MODEL}" \
+        --chroma-dir "${KB_CHROMA_DIR:-/home/tj/chroma_db}" > /tmp/kb_service.log 2>&1 &
     KB_PID=$!
     
     # 等待服务启动

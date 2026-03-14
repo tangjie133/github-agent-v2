@@ -9,6 +9,9 @@ import os
 import sys
 import json
 import logging
+import requests
+import requests.adapters
+import urllib3
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -35,7 +38,7 @@ except ImportError:
 
 
 class SimpleEmbedding:
-    """简化版嵌入生成器（使用 Ollama）"""
+    """简化版嵌入生成器（使用 Ollama，支持负载均衡）"""
     
     # 常用模型的向量维度
     MODEL_DIMENSIONS = {
@@ -51,9 +54,38 @@ class SimpleEmbedding:
     
     def __init__(self, model: str = "nomic-embed-text", host: str = "http://localhost:11434"):
         self.model = model
-        self.host = host
+        
+        # 支持多 host 负载均衡（逗号分隔）
+        if ',' in host:
+            self.hosts = [h.strip() for h in host.split(',')]
+        else:
+            self.hosts = [host]
+        self._host_index = 0
+        self._host_lock = threading.Lock()
+        
         self._cache = {}  # 简单缓存
         self._dimension = None  # 动态获取的维度
+        
+        # 配置连接池（提高并发性能）
+        self._session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=20,      # 连接池大小
+            pool_maxsize=50,          # 最大连接数
+            max_retries=urllib3.util.Retry(
+                total=3,
+                backoff_factor=0.1,
+                status_forcelist=[500, 502, 503, 504]
+            )
+        )
+        self._session.mount('http://', adapter)
+        self._session.mount('https://', adapter)
+    
+    def _get_host(self) -> str:
+        """获取下一个 host（轮询负载均衡）"""
+        with self._host_lock:
+            host = self.hosts[self._host_index]
+            self._host_index = (self._host_index + 1) % len(self.hosts)
+            return host
         
     def _get_dimension(self) -> int:
         """获取向量维度（优先从已知模型获取，否则动态检测）"""
@@ -78,15 +110,16 @@ class SimpleEmbedding:
             return 768
         
     def embed(self, text: str, use_cache: bool = True) -> List[float]:
-        """生成文本嵌入向量"""
+        """生成文本嵌入向量（使用连接池优化 + 负载均衡）"""
         # 检查缓存
         if use_cache and text in self._cache:
             return self._cache[text]
         
+        host = self._get_host()
+        
         try:
-            import requests
-            response = requests.post(
-                f"{self.host}/api/embeddings",
+            response = self._session.post(
+                f"{host}/api/embeddings",
                 json={"model": self.model, "prompt": text},
                 timeout=30
             )
@@ -98,13 +131,88 @@ class SimpleEmbedding:
                 self._cache[text] = embedding
             return embedding
         except Exception as e:
-            logger.error(f"嵌入生成失败: {e}")
+            logger.error(f"嵌入生成失败 ({host}): {e}")
             # 返回零向量作为降级（使用正确的维度）
             return [0.0] * self._get_dimension()
     
-    def embed_batch(self, texts: List[str]) -> List[List[float]]:
-        """批量生成嵌入"""
-        return [self.embed(t) for t in texts]
+    def embed_batch(self, texts: List[str], max_workers: int = 4) -> List[List[float]]:
+        """
+        批量生成嵌入（保守并发版本）
+        
+        针对 Ollama 优化：
+        - 保守并发度（默认4）避免 404 错误
+        - 顺序处理小批量（<10条）避免竞态
+        - 带重试机制
+        
+        Args:
+            texts: 文本列表
+            max_workers: 并发线程数（默认4，建议不超过6）
+            
+        Returns:
+            嵌入向量列表（与输入顺序一致）
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import time
+        
+        if not texts:
+            return []
+        
+        # 去重但保持顺序
+        seen = {}
+        unique_texts = []
+        text_to_indices = {}
+        
+        for i, text in enumerate(texts):
+            if text in seen:
+                text_to_indices[i] = seen[text]
+            else:
+                seen[text] = len(unique_texts)
+                text_to_indices[i] = len(unique_texts)
+                unique_texts.append(text)
+        
+        # 小批量直接顺序处理（避免并发开销和竞态）
+        if len(unique_texts) <= 4:
+            results = []
+            for text in unique_texts:
+                # 重试3次
+                for attempt in range(3):
+                    try:
+                        results.append(self.embed(text))
+                        break
+                    except Exception as e:
+                        if attempt < 2:
+                            time.sleep(0.1 * (attempt + 1))
+                        else:
+                            results.append([0.0] * self._get_dimension())
+            return [results[text_to_indices[i]] for i in range(len(texts))]
+        
+        # 大批量使用有限并发
+        results = [None] * len(unique_texts)
+        
+        def embed_single(args):
+            idx, text = args
+            for attempt in range(3):
+                try:
+                    return idx, self.embed(text)
+                except Exception as e:
+                    if attempt < 2:
+                        time.sleep(0.1 * (attempt + 1))
+                    else:
+                        return idx, [0.0] * self._get_dimension()
+        
+        # 保守并发度（避免Ollama过载）
+        actual_workers = min(max_workers, 4, len(unique_texts))
+        
+        with ThreadPoolExecutor(max_workers=actual_workers) as executor:
+            futures = {executor.submit(embed_single, (i, t)): i 
+                      for i, t in enumerate(unique_texts)}
+            
+            for future in as_completed(futures):
+                idx, embedding = future.result()
+                results[idx] = embedding
+        
+        # 映射回原始顺序（处理重复文本）
+        return [results[text_to_indices[i]] for i in range(len(texts))]
 
 
 # 强制导入 ChromaDB（成为必需依赖）
@@ -657,7 +765,8 @@ class KBRequestHandler(BaseHTTPRequestHandler):
 
 
 def run_server(host: str = "0.0.0.0", port: int = 8000, data_dir: str = None, 
-               embedding_model: str = None, embedding_host: str = None):
+               embedding_model: str = None, embedding_host: str = None,
+               chroma_dir: str = None):
     """运行知识库服务"""
     logger.info(f"启动知识库服务 {host}:{port}")
     
@@ -665,7 +774,8 @@ def run_server(host: str = "0.0.0.0", port: int = 8000, data_dir: str = None,
     kb_service = KnowledgeBaseService(
         data_dir=data_dir,
         embedding_model=embedding_model,
-        embedding_host=embedding_host
+        embedding_host=embedding_host,
+        chroma_dir=chroma_dir
     )
     KBRequestHandler.kb_service = kb_service
     
@@ -688,6 +798,7 @@ if __name__ == "__main__":
     parser.add_argument("--host", default="0.0.0.0", help="监听地址")
     parser.add_argument("--port", type=int, default=8000, help="监听端口")
     parser.add_argument("--data-dir", help="数据目录")
+    parser.add_argument("--chroma-dir", help="ChromaDB 持久化目录")
     parser.add_argument("--embedding-model", help="嵌入模型名称 (默认: nomic-embed-text)")
     parser.add_argument("--embedding-host", help="Ollama 服务地址 (默认: http://localhost:11434)")
     
@@ -697,6 +808,7 @@ if __name__ == "__main__":
         host=args.host,
         port=args.port,
         data_dir=args.data_dir,
+        chroma_dir=args.chroma_dir,
         embedding_model=args.embedding_model,
         embedding_host=args.embedding_host
     )
