@@ -601,9 +601,13 @@ class IssueProcessor:
             
             # Execute code changes
             logger.info("Executing code changes...")
+            # 使用 OpenClaw 生成的详细修改描述，而不是原始 Issue 文本
+            # 这样 AI 能更准确理解需要修改的位置和内容
+            modification_instruction = action_plan.change_description or context.current_instruction or context.body
+            logger.info(f"Using modification instruction: {modification_instruction[:100]}...")
             exec_result = self.code_executor.execute_task(
                 task_type="fix_issue",
-                instruction=context.current_instruction or context.body,
+                instruction=modification_instruction,
                 context=full_context,
                 repo_full_name=f"{owner}/{repo}",
                 issue_number=issue_number,

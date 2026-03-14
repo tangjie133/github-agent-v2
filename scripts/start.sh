@@ -342,16 +342,21 @@ start_kb_service() {
     # 后台启动 KB Service
     info "正在启动 KB Service $KB_HOST:$KB_PORT..."
     info "嵌入模型: ${EMBED_MODEL}"
-    info "状态目录: ${GITHUB_AGENT_STATEDIR:-/tmp/github-agent-state}"
+    info "状态目录: ${GITHUB_AGENT_STATEDIR:-/home/tj/state}"
     cd "$PROJECT_DIR"
+    
+    # 设置日志目录（统一放在 STATEDIR 下）
+    LOG_DIR="${GITHUB_AGENT_STATEDIR:-/home/tj/state}/logs"
+    mkdir -p "$LOG_DIR"
+    KB_LOG_FILE="${LOG_DIR}/kb_service.log"
     
     # 使用 nohup + & 后台运行
     # 显式传递 GITHUB_AGENT_STATEDIR 环境变量
-    nohup env GITHUB_AGENT_STATEDIR="${GITHUB_AGENT_STATEDIR:-/tmp/github-agent-state}" \
+    nohup env GITHUB_AGENT_STATEDIR="${GITHUB_AGENT_STATEDIR:-/home/tj/state}" \
         python3 knowledge_base/kb_service.py \
         --host "$KB_HOST" \
         --port "$KB_PORT" \
-        --embedding-model "${EMBED_MODEL}" > /tmp/kb_service.log 2>&1 &
+        --embedding-model "${EMBED_MODEL}" > "$KB_LOG_FILE" 2>&1 &
     KB_PID=$!
     
     # 等待服务启动
@@ -370,11 +375,11 @@ start_kb_service() {
         show_kb_status
         
         # 保存 PID 到文件（方便后续管理）
-        echo $KB_PID > /tmp/kb_service.pid
+        echo $KB_PID > "${LOG_DIR}/kb_service.pid"
         return 0
     else
         error "KB Service 启动超时"
-        warning "查看日志: tail -f /tmp/kb_service.log"
+        warning "查看日志: tail -f $KB_LOG_FILE"
         return 1
     fi
 }
@@ -671,8 +676,45 @@ start_server() {
     # 设置 PYTHONPATH
     export PYTHONPATH="$PROJECT_DIR:$PYTHONPATH"
     
-    # 启动服务
-    exec python3 main.py --host "$HOST" --port "$PORT"
+    # 导出关键环境变量，确保 webhook_server 使用正确路径
+    export GITHUB_AGENT_STATEDIR="${GITHUB_AGENT_STATEDIR:-/home/tj/state}"
+    export GITHUB_AGENT_WEBHOOK_DIR="${GITHUB_AGENT_STATEDIR}/webhooks"
+    info "使用 STATEDIR: $GITHUB_AGENT_STATEDIR"
+    info "Webhook 目录: $GITHUB_AGENT_WEBHOOK_DIR"
+    
+    # 设置日志文件（统一放在 STATEDIR 下）
+    LOG_DIR="${GITHUB_AGENT_STATEDIR}/logs"
+    mkdir -p "$LOG_DIR"
+    LOG_FILE="${LOG_DIR}/agent.log"
+    KB_LOG_FILE="${LOG_DIR}/kb_service.log"
+    info "日志目录: $LOG_DIR"
+    info "Agent 日志: $LOG_FILE"
+    
+    # 启动服务（后台，输出到日志文件）
+    nohup python3 main.py --host "$HOST" --port "$PORT" > "$LOG_FILE" 2>&1 &
+    AGENT_PID=$!
+    echo $AGENT_PID > "${LOG_DIR}/agent.pid"
+    info "Agent PID: $AGENT_PID"
+    
+    # 等待服务启动
+    sleep 3
+    if curl -s "http://${HOST}:${PORT}/health" > /dev/null 2>&1; then
+        success "Agent 启动成功"
+        info "查看日志: tail -f $LOG_FILE"
+        info "停止服务: kill $AGENT_PID"
+    else
+        warning "Agent 可能未完全启动，请检查日志: $LOG_FILE"
+        return 1
+    fi
+    
+    # 如果不是 daemon 模式，保持脚本运行（避免触发 EXIT 导致 cleanup）
+    if [[ "${DAEMON_MODE:-0}" != "1" ]]; then
+        info "按 Ctrl+C 停止服务"
+        tail -f "$LOG_FILE" &
+        TAIL_PID=$!
+        wait $AGENT_PID 2>/dev/null
+        kill $TAIL_PID 2>/dev/null
+    fi
 }
 
 # 主函数
@@ -696,6 +738,10 @@ main() {
                 SKIP_HEALTH_CHECK=1
                 shift
                 ;;
+            --daemon)
+                DAEMON_MODE=1
+                shift
+                ;;
             --help)
                 echo "用法: $0 [选项]"
                 echo ""
@@ -704,6 +750,7 @@ main() {
                 echo "  --port <port>           监听端口 (默认: 8080)"
                 echo "  --log-level <level>     日志级别 (默认: INFO)"
                 echo "  --skip-health-check     跳过服务健康检查"
+                echo "  --daemon                后台模式启动（不阻塞终端）"
                 echo "  --help                  显示帮助"
                 echo ""
                 echo "环境变量配置 (.env):"
@@ -740,7 +787,7 @@ main() {
     start_server
 }
 
-# 捕获中断信号，确保停止所有服务
+# 捕获中断信号，确保停止所有服务（非 daemon 模式）
 cleanup() {
     echo ""
     info "正在停止所有服务..."
@@ -755,7 +802,10 @@ cleanup() {
     exit 0
 }
 
-trap cleanup INT TERM EXIT
+# 非 daemon 模式设置信号捕获
+if [[ "${DAEMON_MODE:-0}" != "1" ]]; then
+    trap cleanup INT TERM EXIT
+fi
 
 # 运行主函数
 main "$@"
