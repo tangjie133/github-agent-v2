@@ -411,15 +411,31 @@ class GitHubRepoWatcher:
                 logger.info(f"   ✅ PDF {action}完成: {stats['pages_stored']}/{stats['pages_processed']} 页已存储")
                 if stats['batches'] > 1:
                     logger.info(f"   📦 共分 {stats['batches']} 批处理")
-                return True
+                success = True
             else:
                 logger.warning(f"   ⚠️ PDF 未存储任何页面")
-                return False
+                success = False
+            
+            # 清理临时PDF文件
+            try:
+                if pdf_path.exists():
+                    pdf_path.unlink()
+                    logger.debug(f"   🗑️ 临时PDF已清理: {pdf_path.name}")
+            except Exception as e:
+                logger.warning(f"   ⚠️ 临时PDF清理失败: {e}")
+            
+            return success
                 
         except Exception as e:
             logger.error(f"   ❌ PDF 直接处理失败: {e}")
             import traceback
             logger.debug(traceback.format_exc())
+            # 异常时也尝试清理临时文件
+            try:
+                if pdf_path.exists():
+                    pdf_path.unlink()
+            except:
+                pass
             return False
     
     def convert_to_markdown(self, input_path: Path, output_path: Path) -> bool:
@@ -586,8 +602,9 @@ class GitHubRepoWatcher:
                     stats['failed'] += 1
                     stats['details'].append({'file': file_path, 'status': 'failed', 'reason': 'convert'})
             
-            # 清理临时文件
-            temp_file.unlink(missing_ok=True)
+            # 清理临时文件（注意：PDF处理需要自己负责清理，因为它可能是异步的）
+            if ext != '.pdf':
+                temp_file.unlink(missing_ok=True)
         
         # 保存同步状态
         self._save_sync_state(sync_state)
