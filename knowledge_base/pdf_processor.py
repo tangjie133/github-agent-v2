@@ -557,6 +557,8 @@ class PDFProcessor:
                 meta = {
                     **page.metadata,
                     "doc_id": doc_id,
+                    "doc_type": "pdf",
+                    "file_ext": ".pdf",
                     "content_preview": page.content[:200],
                     "processed_at": time.time()
                 }

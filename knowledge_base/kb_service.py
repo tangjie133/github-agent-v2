@@ -79,6 +79,7 @@ class SimpleEmbedding:
         )
         self._session.mount('http://', adapter)
         self._session.mount('https://', adapter)
+        
     
     def _get_host(self) -> str:
         """获取下一个 host（轮询负载均衡）"""
@@ -88,13 +89,8 @@ class SimpleEmbedding:
             return host
         
     def _get_dimension(self) -> int:
-        """获取向量维度（优先从已知模型获取，否则动态检测）"""
+        """获取向量维度（动态检测，结果缓存）"""
         if self._dimension is not None:
-            return self._dimension
-        
-        # 从已知模型列表查找
-        if self.model in self.MODEL_DIMENSIONS:
-            self._dimension = self.MODEL_DIMENSIONS[self.model]
             return self._dimension
         
         # 尝试动态检测（调用一次嵌入服务）
@@ -103,8 +99,13 @@ class SimpleEmbedding:
             self._dimension = len(test_embedding)
             logger.info(f"检测到模型 '{self.model}' 的向量维度: {self._dimension}")
             return self._dimension
-        except Exception:
-            # 默认使用768
+        except Exception as e:
+            # 如果动态检测失败，从已知模型列表查找
+            if self.model in self.MODEL_DIMENSIONS:
+                self._dimension = self.MODEL_DIMENSIONS[self.model]
+                logger.warning(f"动态检测失败 ({e})，使用预配置维度: {self._dimension}")
+                return self._dimension
+            # 最后默认使用768
             logger.warning(f"无法检测模型 '{self.model}' 的维度，使用默认值 768")
             self._dimension = 768
             return 768
@@ -125,6 +126,11 @@ class SimpleEmbedding:
             )
             response.raise_for_status()
             embedding = response.json()["embedding"]
+            
+            # 检查 NaN 或无效值
+            if any(x != x for x in embedding) or all(x == 0.0 for x in embedding):  # NaN check
+                logger.warning(f"Embedding 包含 NaN 或全零: {host}")
+                return [0.0] * self._get_dimension()
             
             # 缓存结果
             if use_cache:
@@ -260,6 +266,34 @@ class ChromaVectorStore:
             logger.error(f"ChromaDB 初始化失败: {e}")
             raise RuntimeError(f"ChromaDB 初始化失败: {e}")
     
+    def get_dimension(self) -> Optional[int]:
+        """获取当前集合的向量维度（从已有文档推断）"""
+        try:
+            # 获取一个文档来确定维度
+            result = self.collection.get(limit=1, include=["embeddings"])
+            if result and result.get('embeddings') is not None:
+                embeddings = result['embeddings']
+                # 支持 numpy array 或 list
+                if hasattr(embeddings, '__len__') and len(embeddings) > 0:
+                    first_emb = embeddings[0]
+                    # numpy array 或 list 都支持 len()
+                    return len(first_emb)
+        except Exception:
+            pass
+        return None
+    
+    def check_dimension_compatibility(self, expected_dim: int) -> bool:
+        """检查期望维度与现有数据是否兼容"""
+        existing_dim = self.get_dimension()
+        if existing_dim is None:
+            # 集合为空，任何维度都可以
+            return True
+        if existing_dim != expected_dim:
+            logger.error(f"❌ 维度不匹配: 数据库使用 {existing_dim} 维, 当前模型输出 {expected_dim} 维")
+            logger.error(f"   请清空数据库或切换回原来的模型")
+            return False
+        return True
+    
     def add_with_embedding(self, text: str, embedding: List[float], metadata: Dict[str, Any] = None):
         """添加带嵌入的文档"""
         try:
@@ -393,6 +427,20 @@ class KnowledgeBaseService:
             collection_name="knowledge_base",
             distance_fn="cosine"
         )
+        
+        # 检查维度兼容性
+        expected_dim = self.embedder._get_dimension()
+        existing_dim = self.vector_store.get_dimension()
+        if existing_dim is not None and existing_dim != expected_dim:
+            logger.error("=" * 60)
+            logger.error("❌ 模型维度不匹配！")
+            logger.error(f"   数据库已有数据: {existing_dim} 维")
+            logger.error(f"   当前模型 '{self.embedding_model}': {expected_dim} 维")
+            logger.error("   解决方案:")
+            logger.error("   1. 切换回原来的模型（修改 KB_EMBEDDING_MODEL）")
+            logger.error("   2. 清空数据库重新录入（删除 KB_CHROMA_DIR 目录）")
+            logger.error("=" * 60)
+            raise RuntimeError(f"模型维度不匹配: 数据库使用 {existing_dim} 维, 当前模型输出 {expected_dim} 维")
         
         # 初始化 PDF 处理器（读取环境变量配置）
         try:

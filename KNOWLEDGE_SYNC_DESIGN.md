@@ -1,486 +1,434 @@
-# 知识库同步设计 - 可移植的学习成果
+# 知识库同步设计 - 统一存储架构
 
 ## 设计目标
 
-1. **可移植性**: 学习成果可以导出到资料仓库，在新环境部署时拉取
-2. **共享性**: 团队可以共享成功案例和代码模式
-3. **版本控制**: 知识数据可以版本管理，支持回滚
-4. **自动化**: 学习成功后自动同步到资料仓库
-
-## 架构设计
-
-```
-┌─────────────────┐     学习成功      ┌─────────────────┐
-│   GitHub Agent  │ ───────────────→ │  本地知识库     │
-│   (运行时)      │                  │  (SQLite/JSON)  │
-└─────────────────┘                  └────────┬────────┘
-       │                                      │
-       │ 自动同步                             │ 导出
-       │                                      │
-       ▼                                      ▼
-┌─────────────────┐                  ┌─────────────────┐
-│   资料仓库      │ ←────────────────│  知识导出器     │
-│ (GitHub Repo)   │    定期推送      │                 │
-└─────────────────┘                  └─────────────────┘
-       ▲                                      
-       │ 新环境部署                            
-       │                                      
-┌─────────────────┐                           
-│   新 GitHub     │                           
-│   Agent 实例    │                           
-└─────────────────┘                           
-```
-
-## 知识数据格式
-
-### 1. 成功案例库 (cases/)
-
-```json
-// cases/2026/03/sensor_filter_a0.json
-{
-  "schema_version": "1.0",
-  "case_id": "case_20260312_001",
-  "created_at": "2026-03-12T10:30:00Z",
-  "repository": "owner/arduino-project",
-  "issue": {
-    "number": 42,
-    "title": "Fix analogRead noise on A0",
-    "body": "The sensor readings from A0 are very noisy...",
-    "keywords": ["analogRead", "A0", "noise", "filter", "sensor"],
-    "embedding": [0.12, -0.05, 0.89, ...],  // 768维向量
-    "language": "arduino",
-    "complexity": "simple"
-  },
-  "solution": {
-    "description": "Add moving average filter to smooth sensor readings",
-    "approach": "filter",
-    "files_modified": [
-      {
-        "path": "sensor.ino",
-        "language": "arduino",
-        "changes": [
-          {
-            "type": "add",
-            "description": "Add filter array and variables"
-          },
-          {
-            "type": "modify",
-            "description": "Replace direct read with filtered read"
-          }
-        ]
-      }
-    ],
-    "code_pattern": {
-      "pattern_type": "moving_average_filter",
-      "search_context": "int value = analogRead(A0);",
-      "replacement_template": "// Moving average filter\nint readings[{window_size}];\nint readIndex = 0;\nint total = 0;\n// ... filter implementation",
-      "parameters": {
-        "window_size": {
-          "type": "int",
-          "default": 10,
-          "description": "Filter window size"
-        }
-      }
-    },
-    "arduino_specific": {
-      "pins_involved": ["A0"],
-      "libraries_used": ["Wire"],
-      "libraries_added": [],
-      "memory_impact": "low"  // SRAM usage
-    }
-  },
-  "outcome": {
-    "success": true,
-    "pr_number": 43,
-    "pr_merged": true,
-    "user_feedback": "positive",
-    "test_results": "passed"
-  },
-  "metadata": {
-    "agent_version": "2.1.0",
-    "model_used": "qwen3-coder:30b",
-    "confidence_score": 0.92,
-    "reviewed_by_human": false
-  }
-}
-```
-
-### 2. 代码模式库 (patterns/)
-
-```json
-// patterns/arduino/moving_average_filter.json
-{
-  "pattern_id": "pattern_moving_average_001",
-  "schema_version": "1.0",
-  "created_at": "2026-03-12T10:30:00Z",
-  "updated_at": "2026-03-12T10:30:00Z",
-  "usage_count": 5,
-  "success_rate": 1.0,
-  
-  "pattern": {
-    "name": "moving_average_filter",
-    "description": "Apply moving average filter to analog sensor readings",
-    "language": "arduino",
-    "category": "filtering",
-    "complexity": "simple",
-    
-    "applicability": {
-      "keywords": ["analogRead", "noise", "smooth", "filter"],
-      "code_signatures": [
-        "analogRead\\(A\\d+\\)"
-      ],
-      "file_patterns": ["*.ino", "*.cpp"]
-    },
-    
-    "template": {
-      "variables_section": "int readings[{window_size}];\nint readIndex = 0;\nint total = 0;\nint average = 0;",
-      "setup_section": "// Initialize filter\nfor (int i = 0; i < {window_size}; i++) {\n  readings[i] = 0;\n}",
-      "loop_section": "// Moving average filter\ntotal = total - readings[readIndex];\nreadings[readIndex] = analogRead({pin});\ntotal = total + readings[readIndex];\nreadIndex++;\nif (readIndex >= {window_size}) readIndex = 0;\naverage = total / {window_size};",
-      "parameters": {
-        "window_size": {
-          "type": "int",
-          "default": 10,
-          "min": 2,
-          "max": 100,
-          "description": "Number of samples for averaging"
-        },
-        "pin": {
-          "type": "string",
-          "placeholder": "A0",
-          "description": "Analog pin to read from"
-        }
-      }
-    },
-    
-    "examples": [
-      {
-        "case_id": "case_20260312_001",
-        "repo": "owner/arduino-project",
-        "effectiveness": "high"
-      }
-    ]
-  },
-  
-  "metadata": {
-    "derived_from_cases": ["case_20260312_001", "case_20260312_005"],
-    "reviewed": true,
-    "author": "agent-learning"
-  }
-}
-```
-
-### 3. 错误模式库 (anti_patterns/)
-
-```json
-// anti_patterns/arduino/delay_in_loop.json
-{
-  "anti_pattern_id": "anti_delay_loop_001",
-  "schema_version": "1.0",
-  
-  "pattern": {
-    "name": "delay_in_main_loop",
-    "description": "Using delay() in main loop blocks other operations",
-    "language": "arduino",
-    "severity": "warning",
-    
-    "detection": {
-      "code_pattern": "delay\\(\\d+\\);",
-      "context": "loop() function"
-    },
-    
-    "solution": {
-      "description": "Use millis() based non-blocking approach",
-      "replacement_pattern": "pattern_non_blocking_timer",
-      "explanation": "delay() blocks all execution. Use millis() to check elapsed time without blocking."
-    }
-  },
-  
-  "occurrences": [
-    {
-      "case_id": "case_20260310_003",
-      "repo": "owner/project-a",
-      "resolved": true
-    }
-  ]
-}
-```
-
-### 4. 索引文件 (index.json)
-
-```json
-{
-  "schema_version": "1.0",
-  "last_updated": "2026-03-12T12:00:00Z",
-  "stats": {
-    "total_cases": 156,
-    "total_patterns": 42,
-    "total_anti_patterns": 18,
-    "language_distribution": {
-      "arduino": 89,
-      "python": 67
-    },
-    "success_rate": 0.87
-  },
-  
-  "indices": {
-    "by_keyword": {
-      "analogRead": ["case_20260312_001", "case_20260311_045"],
-      "filter": ["case_20260312_001", "pattern_moving_average_001"]
-    },
-    "by_pin": {
-      "A0": ["case_20260312_001", "case_20260310_023"],
-      "13": ["case_20260309_012"]
-    },
-    "by_library": {
-      "Wire": ["case_20260312_001", "case_20260311_032"]
-    }
-  },
-  
-  "recent_additions": [
-    {
-      "type": "case",
-      "id": "case_20260312_001",
-      "date": "2026-03-12T10:30:00Z"
-    }
-  ]
-}
-```
-
-## 同步机制
-
-### 1. 自动推送流程
-
-```python
-class KnowledgeSyncManager:
-    """知识库同步管理器"""
-    
-    def __init__(self, 
-                 knowledge_repo_url: str,
-                 local_kb_path: Path,
-                 github_token: str):
-        self.knowledge_repo_url = knowledge_repo_url
-        self.local_kb_path = local_kb_path
-        self.github_token = github_token
-        
-    def on_learning_success(self, case: SuccessCase):
-        """学习成功后的回调"""
-        # 1. 保存到本地
-        self.save_to_local(case)
-        
-        # 2. 尝试推送到资料仓库
-        try:
-            self.push_to_knowledge_repo(case)
-        except Exception as e:
-            # 推送失败不阻塞主流程，记录待同步
-            self.mark_pending_sync(case)
-    
-    def push_to_knowledge_repo(self, case: SuccessCase):
-        """推送到资料仓库"""
-        # 1. 克隆/拉取资料仓库
-        repo_path = self.ensure_knowledge_repo()
-        
-        # 2. 生成文件路径
-        case_file = self.generate_case_path(case)
-        
-        # 3. 检查是否已存在（去重）
-        if self.case_exists(repo_path, case_file):
-            # 更新现有案例
-            self.update_case(repo_path, case_file, case)
-        else:
-            # 创建新案例
-            self.create_case(repo_path, case_file, case)
-        
-        # 4. 更新索引
-        self.update_index(repo_path, case)
-        
-        # 5. 提交并推送
-        self.commit_and_push(repo_path, case)
-    
-    def generate_case_path(self, case: SuccessCase) -> Path:
-        """生成案例文件路径"""
-        # 按年月组织，避免单目录文件过多
-        date = datetime.fromisoformat(case.created_at)
-        return Path(f"cases/{date.year}/{date.month:02d}/{case.case_id}.json")
-```
-
-### 2. 定期同步策略
-
-```python
-class KnowledgeSyncScheduler:
-    """知识库同步调度器"""
-    
-    def __init__(self, sync_manager: KnowledgeSyncManager):
-        self.sync_manager = sync_manager
-        self.pending_queue = []
-        
-    def start(self):
-        """启动定时同步"""
-        # 每 30 分钟检查一次待同步项
-        schedule.every(30).minutes.do(self.sync_pending)
-        
-        # 每天一次完整同步（处理冲突）
-        schedule.every().day.at("02:00").do(self.full_sync)
-    
-    def sync_pending(self):
-        """同步待处理项"""
-        for case in self.pending_queue[:]:
-            try:
-                self.sync_manager.push_to_knowledge_repo(case)
-                self.pending_queue.remove(case)
-            except Exception as e:
-                logger.warning(f"同步失败，保留在队列: {case.case_id}")
-    
-    def full_sync(self):
-        """完整同步（拉取远程更新）"""
-        # 1. 拉取远程最新
-        self.sync_manager.pull_from_knowledge_repo()
-        
-        # 2. 检测冲突
-        conflicts = self.detect_conflicts()
-        
-        # 3. 自动合并或标记人工处理
-        for conflict in conflicts:
-            self.resolve_conflict(conflict)
-```
-
-### 3. 新环境初始化
-
-```python
-class KnowledgeInitializer:
-    """知识库初始化器（新环境使用）"""
-    
-    def __init__(self, 
-                 knowledge_repo_url: str,
-                 local_kb_path: Path,
-                 github_token: str):
-        self.knowledge_repo_url = knowledge_repo_url
-        self.local_kb_path = local_kb_path
-        self.github_token = github_token
-        
-    def initialize(self, sync_mode: str = "full"):
-        """初始化本地知识库
-        
-        Args:
-            sync_mode: 
-                - "full": 拉取全部知识数据
-                - "recent": 只拉取最近 N 天
-                - "minimal": 只拉取模式库，不拉案例详情
-        """
-        # 1. 克隆资料仓库
-        repo_path = self.clone_knowledge_repo()
-        
-        # 2. 根据模式导入
-        if sync_mode == "full":
-            self.import_all_cases(repo_path)
-        elif sync_mode == "recent":
-            self.import_recent_cases(repo_path, days=30)
-        elif sync_mode == "minimal":
-            self.import_patterns_only(repo_path)
-        
-        # 3. 重建向量索引
-        self.rebuild_embeddings()
-        
-        # 4. 验证完整性
-        self.verify_integrity()
-        
-        logger.info(f"知识库初始化完成，模式: {sync_mode}")
-```
-
-## 版本控制策略
-
-### 1. 案例版本管理
-
-```json
-{
-  "case_id": "case_20260312_001",
-  "version": "1.2",
-  "version_history": [
-    {
-      "version": "1.0",
-      "date": "2026-03-12T10:30:00Z",
-      "change": "initial"
-    },
-    {
-      "version": "1.1", 
-      "date": "2026-03-12T14:20:00Z",
-      "change": "added_test_results",
-      "diff": "..."
-    }
-  ]
-}
-```
-
-### 2. 冲突解决规则
-
-| 冲突场景 | 解决策略 |
-|---------|---------|
-| 同一案例本地和远程都更新 | 合并字段，保留最新时间戳 |
- | 本地新案例 vs 远程新案例 | 都保留，可能产生重复（人工审核）|
-| 案例被远程删除但本地有更新 | 保留本地版本，标记待审核 |
-| 模式参数冲突 | 创建新模式版本，保留旧版本 |
-
-## 资料仓库结构
-
-```
-knowledge-base-repo/
-├── README.md                    # 知识库说明
-├── SCHEMA.md                    # 数据格式文档
-├── index.json                   # 主索引
-│
-├── cases/                       # 成功案例
-│   ├── 2026/
-│   │   ├── 03/
-│   │   │   ├── case_20260312_001.json
-│   │   │   └── case_20260312_002.json
-│   │   └── 02/
-│   └── 2025/
-│
-├── patterns/                    # 代码模式
-│   ├── arduino/
-│   │   ├── moving_average_filter.json
-│   │   ├── debounce_button.json
-│   │   └── i2c_scanner.json
-│   └── python/
-│       ├── error_handling.json
-│       └── logging_setup.json
-│
-├── anti_patterns/               # 反模式/常见错误
-│   └── arduino/
-│       ├── delay_in_loop.json
-│       └── blocking_serial.json
-│
-├── chips/                       # 芯片特定知识
-│   ├── SD3031/
-│   │   ├── register_map.json
-│   │   └── common_issues.json
-│   └── DS3231/
-│
-├── stats/                       # 统计数据
-│   ├── monthly_report_2026_03.json
-│   └── learning_progress.json
-│
-└── .github/
-    └── workflows/
-        └── validate-schema.yml  # 数据格式验证
-```
-
-## 隐私和安全考虑
-
-1. **敏感信息过滤**: 自动移除代码中的 API Key、密码等
-2. **仓库隐私**: 资料仓库可以是私有的
-3. **权限控制**: 使用 GitHub Token 控制读写权限
-4. **审计日志**: 记录谁添加了什么知识
-
-## 实现优先级
-
-| 阶段 | 功能 | 优先级 |
-|------|------|--------|
-| Phase 1 | 案例存储结构 + 本地保存 | 🔴 高 |
-| Phase 2 | 推送到资料仓库 | 🔴 高 |
-| Phase 3 | 新环境拉取初始化 | 🟡 中 |
-| Phase 4 | 模式提取和复用 | 🟡 中 |
-| Phase 5 | 自动冲突解决 | 🟢 低 |
+1. **单一数据源**: GitHub 仓库作为唯一数据源，ChromaDB 作为唯一存储
+2. **无本地文件依赖**: 所有文档直接处理存入向量库，不保留本地文件
+3. **高性能**: 利用多线程和优化解析器提升处理速度
+4. **可移植性**: ChromaDB 目录可直接复制迁移
+5. **版本控制**: 源文件版本由 GitHub 管理，同步状态独立追踪
 
 ---
 
-你觉得这个设计如何？是否需要调整某些部分，或者你想先从哪个阶段开始实现？
+## 架构设计
+
+### 统一存储架构
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      GitHub 仓库                             │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐       │
+│  │  datasheet/  │  │   guides/    │  │  examples/   │       │
+│  │  *.pdf       │  │   *.md       │  │   *.txt      │       │
+│  └──────────────┘  └──────────────┘  └──────────────┘       │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              │ Webhook / 定时拉取
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                 github_repo_watcher.py                       │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │  1. 检测文件变更                                       │  │
+│  │     - 对比 SHA（同步状态文件）                          │  │
+│  │     - 检查 ChromaDB 中是否已存在                        │  │
+│  └───────────────────────────────────────────────────────┘  │
+                              │
+                              │ 下载到临时目录
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│  2. 文档解析（根据文件类型）                                  │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐       │
+│  │  PDF         │  │  Markdown    │  │  TXT/DOCX    │       │
+│  │  PyMuPDF     │  │  直接读取    │  │  文本提取    │       │
+│  │  ~70页/s     │  │  即时        │  │  <1s         │       │
+│  └──────────────┘  └──────────────┘  └──────────────┘       │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              │ 分段处理（长文档）
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│  3. 并行生成 Embedding                                       │
+│     - 批量请求 Ollama API                                    │
+│     - 4-8 线程并发（可配置）                                  │
+│     - 连接池优化 HTTP 请求                                    │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│  4. ChromaDB 存储                                            │
+│     /home/tj/chroma_db/                                      │
+│     - 向量数据                                               │
+│     - 元数据索引                                             │
+│     - 自动持久化                                             │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              │ 清理临时文件
+                              ▼
+                        [完成]
+```
+
+---
+
+## 同步流程详解
+
+### 1. 变更检测
+
+```python
+# 同步状态文件: /home/tj/state/.github_kb_sync_state.json
+{
+  "datasheet/esp32.pdf": "abc123...",
+  "guides/i2c.md": "def456..."
+}
+
+# 检测逻辑:
+1. 获取 GitHub 文件列表和 SHA
+2. 对比本地同步状态
+3. 如果 SHA 匹配，检查 ChromaDB 中是否存在
+4. 如果不存在或 SHA 不匹配，需要重新处理
+```
+
+### 2. 文档解析
+
+#### PDF 解析流程
+```python
+import fitz  # PyMuPDF
+
+with fitz.open(pdf_path) as pdf:
+    for page_num in range(len(pdf)):
+        page = pdf[page_num]
+        text = page.get_text()
+        # 每页独立处理
+        embedding = embedder.embed(text)
+        store.add(text, embedding, metadata={
+            "source": "esp32.pdf",
+            "page": page_num + 1,
+            "doc_type": "pdf"
+        })
+```
+
+#### Markdown/TXT/DOCX 解析流程
+```python
+# 1. 提取文本
+if ext == '.md':
+    content = file.read_text()
+elif ext == '.txt':
+    content = f"# {filename}\n\n```\n{file.read_text()}\n```"
+elif ext == '.docx':
+    content = extract_from_docx(file)
+
+# 2. 长文档分段
+if len(content) > 2000:
+    chunks = split_into_chunks(content, chunk_size=2000)
+else:
+    chunks = [content]
+
+# 3. 每段生成 embedding
+for idx, chunk in enumerate(chunks, 1):
+    embedding = embedder.embed(chunk)
+    store.add(chunk, embedding, metadata={
+        "source": filename,
+        "chunk_index": idx,
+        "total_chunks": len(chunks),
+        "doc_type": "document"
+    })
+```
+
+### 3. 并行 Embedding 生成
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+
+def embed_batch(texts):
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        embeddings = list(executor.map(embedder.embed, texts))
+    return embeddings
+
+# 批量处理（50-100页/批）
+for batch in chunks(pages, batch_size=50):
+    embeddings = embed_batch([p.content for p in batch])
+    for page, embedding in zip(batch, embeddings):
+        store.add(page.content, embedding, page.metadata)
+```
+
+### 4. ChromaDB 存储
+
+```python
+# 集合名称: knowledge_base
+# 持久化目录: /home/tj/chroma_db
+
+vector_store.add_with_embedding(
+    text=content,
+    embedding=embedding,
+    metadata={
+        "source": "datasheet/esp32.pdf",
+        "doc_type": "pdf",  # 或 "document"
+        "page": 42,
+        "chunk_index": 1,
+        "total_chunks": 5,
+        "category": "chip_doc",  # 或 "best_practice"
+        "file_ext": ".pdf",
+        "vendor": "espressif",
+        "chip": "esp32",
+        "processed_at": timestamp
+    }
+)
+```
+
+---
+
+## 元数据设计
+
+### 统一元数据格式
+
+```json
+{
+  "source": "datasheet/esp32.pdf",
+  "doc_type": "pdf|document",
+  "file_ext": ".pdf|.md|.txt|.docx",
+  "category": "chip_doc|best_practice",
+  
+  "// PDF 特有": "",
+  "page": 42,
+  "total_pages": 110,
+  "vendor": "espressif",
+  "chip": "esp32",
+  
+  "// 分段文档特有": "",
+  "chunk_index": 1,
+  "total_chunks": 5,
+  
+  "// 通用": "",
+  "content_preview": "前200字符预览",
+  "processed_at": 1773452624.022
+}
+```
+
+### 分类规则
+
+| 规则 | 分类 | 示例 |
+|------|------|------|
+| 文件名含 `chip/芯片/hardware/datasheet` | `chip_doc` | `bmi160_datasheet.pdf` |
+| 其他文件 | `best_practice` | `coding_guide.md` |
+
+---
+
+## 存储对比
+
+### 旧架构（混合存储）
+
+```
+PDF: GitHub → 本地临时 → 解析 → ChromaDB ✅
+MD:  GitHub → 本地文件 → KB Service加载 → ChromaDB ❌
+TXT: GitHub → 本地文件 → KB Service加载 → ChromaDB ❌
+DOCX: GitHub → 本地文件 → KB Service加载 → ChromaDB ❌
+```
+
+**问题：**
+1. 本地文件和 ChromaDB 可能不一致
+2. 启动时需要加载本地文件，增加启动时间
+3. 路径管理复杂
+
+### 新架构（统一存储）
+
+```
+所有类型: GitHub → 本地临时 → 解析 → ChromaDB ✅
+               ↓
+         清理临时文件
+```
+
+**优势：**
+1. 单一数据源（GitHub）+ 单一存储（ChromaDB）
+2. 启动时直接读取 ChromaDB，无需加载本地文件
+3. 简化架构，易于维护
+
+---
+
+## 性能设计
+
+### 解析性能
+
+| 文件类型 | 解析器 | 速度 | 备注 |
+|---------|--------|------|------|
+| PDF | PyMuPDF | ~70页/s | 比 pdfplumber 快 70 倍 |
+| Markdown | 原生 | 即时 | 直接读取 |
+| TXT | 原生 | 即时 | 包装为 Markdown |
+| DOCX | python-docx | <1s | 纯文本提取 |
+
+### 并发设计
+
+```
+文档解析（单线程）
+    ↓
+分批（50-100页/批）
+    ↓
+并行 Embedding（4-8线程）
+    ↓
+批量写入 ChromaDB
+```
+
+### 性能指标
+
+| 场景 | 优化前 | 优化后 | 提升 |
+|------|--------|--------|------|
+| 110页 PDF | ~60s | ~10s | 6x |
+| 启动时间 | ~30s | ~3s | 10x |
+| 检索延迟 | ~161ms | ~0.2ms | 750x |
+
+---
+
+## 配置参数
+
+### 环境变量
+
+```bash
+# 存储路径
+KB_CHROMA_DIR=/home/tj/chroma_db
+GITHUB_AGENT_WORKDIR=/home/tj/github-agent-v2
+GITHUB_AGENT_STATEDIR=/home/tj/state
+
+# PDF 处理
+KB_PDF_WORKERS=4                    # 并行线程数（默认 CPU/4）
+KB_PDF_PARALLEL_THRESHOLD=3         # 启用并行阈值（页数）
+
+# 嵌入模型
+KB_EMBEDDING_MODEL=bge-m3:latest
+KB_EMBEDDING_HOST=http://localhost:11434
+
+# 文档分段
+KB_CHUNK_SIZE=2000                  # 每段最大字符数（可选）
+```
+
+### 目录结构
+
+```
+/home/tj/
+├── chroma_db/                    # ChromaDB 向量存储（持久化）
+│   ├── chroma.sqlite3
+│   └── ...
+├── github-agent-v2/              # 工作目录（临时文件，可清理）
+│   └── github_kb_sync/
+│       └── temp_xxx.pdf
+└── state/                        # 同步状态（持久化）
+    └── .github_kb_sync_state.json
+```
+
+---
+
+## 故障恢复
+
+### 场景 1: ChromaDB 数据损坏
+
+```bash
+# 1. 停止服务
+pkill -f kb_service
+
+# 2. 删除损坏的 ChromaDB
+rm -rf /home/tj/chroma_db
+
+# 3. 重新同步（从 GitHub 重建）
+python scripts/github_repo_watcher.py --sync
+
+# 4. 启动服务
+python -m knowledge_base.kb_service
+```
+
+### 场景 2: 同步状态丢失
+
+```bash
+# 删除同步状态文件
+rm /home/tj/state/.github_kb_sync_state.json
+
+# 重新同步（会重新处理所有文件）
+python scripts/github_repo_watcher.py --sync
+```
+
+### 场景 3: 临时文件堆积
+
+```bash
+# 清理工作目录
+rm -rf /home/tj/github-agent-v2/github_kb_sync/*
+
+# 注意：正常流程会自动清理临时文件，堆积可能是异常中断导致
+```
+
+---
+
+## 注意事项
+
+### 1. 不再使用的目录
+
+以下目录**不再写入文件**，仅保留代码兼容性：
+
+```bash
+knowledge_base/chips/          # 原芯片文档存储
+knowledge_base/best_practices/ # 原最佳实践存储
+```
+
+**清理命令**（可选）：
+```bash
+rm -rf knowledge_base/chips/* knowledge_base/best_practices/*
+```
+
+### 2. 向量维度一致性
+
+切换嵌入模型时需要重建 ChromaDB：
+
+```bash
+# 查看当前模型
+curl http://localhost:11434/api/tags
+
+# 切换模型前清理
+cp -r /home/tj/chroma_db /home/tj/chroma_db.backup
+rm -rf /home/tj/chroma_db
+
+# 修改 .env 中的 KB_EMBEDDING_MODEL
+# 重新同步
+python scripts/github_repo_watcher.py --sync
+```
+
+### 3. 大文件处理
+
+超过 100MB 的 PDF 可能需要：
+- 增加 `KB_PDF_WORKERS` 以提升并发
+- 或者拆分为多个小文件
+
+---
+
+## 附录
+
+### A. 同步状态文件格式
+
+```json
+{
+  "datasheet/esp32.pdf": {
+    "sha": "abc123...",
+    "synced_at": "2026-03-14T09:30:00Z"
+  },
+  "guides/i2c.md": {
+    "sha": "def456...",
+    "synced_at": "2026-03-14T09:30:00Z"
+  }
+}
+```
+
+### B. ChromaDB 集合结构
+
+```python
+Collection: knowledge_base
+- embedding_function: 默认（使用预计算向量）
+- metadata: 见上文统一元数据格式
+- distance: cosine
+```
+
+### C. 监控指标
+
+```bash
+# 查看文档数量
+curl http://localhost:8000/stats | jq '.total_documents'
+
+# 查看 ChromaDB 大小
+du -sh /home/tj/chroma_db
+
+# 查看同步日志
+tail -f /tmp/github_kb_sync.log
+```

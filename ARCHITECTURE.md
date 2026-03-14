@@ -6,10 +6,10 @@
 
 1. [架构总览](#架构总览)
 2. [设计原则](#设计原则)
-3. [分层架构](#分层架构)
+3. [知识库架构](#知识库架构)
 4. [数据流](#数据流)
 5. [关键技术决策](#关键技术决策)
-6. [安全设计](#安全设计)
+6. [配置说明](#配置说明)
 
 ---
 
@@ -84,6 +84,7 @@ GitHub Agent V2 采用**分层架构 + 管道模式**，将复杂的自动化流
 - `cloud_agent/` - 只负责意图识别
 - `code_executor/` - 只负责代码生成和执行
 - `github_api/` - 只负责与 GitHub API 交互
+- `knowledge_base/` - 只负责文档存储和检索
 
 ### 2. 依赖倒置原则 (DIP)
 
@@ -101,12 +102,33 @@ class IssueProcessor:
         self.github = ConcreteGitHubClient()  # ❌
 ```
 
-### 3. 开闭原则 (OCP)
+### 3. 统一存储架构
 
-对扩展开放，对修改关闭：
+所有文档类型采用统一的存储架构：
 
-- 新增意图类型只需扩展 `IntentType`，无需修改核心处理器
-- 新增 LLM 提供商只需实现相应客户端，无需修改业务逻辑
+```
+┌─────────────────────────────────────────────────────────┐
+│                    统一存储架构                          │
+├─────────────────────────────────────────────────────────┤
+│  GitHub 文件                                            │
+│  (.pdf/.md/.txt/.docx)                                  │
+│       ↓                                                 │
+│  下载到临时目录 (WORKDIR)                                │
+│       ↓                                                 │
+│  文本提取/解析                                          │
+│  - PDF: PyMuPDF 按页解析                                │
+│  - Markdown: 直接读取                                   │
+│  - TXT: 包装为 Markdown                                  │
+│  - DOCX: python-docx/pandoc 提取                        │
+│       ↓                                                 │
+│  分段处理（长文档）                                      │
+│       ↓                                                 │
+│  并行生成 embedding (Ollama)                            │
+│       ↓                                                 │
+│  ChromaDB 存储（统一向量库）                             │
+│  - 元数据: source, doc_type, page/chunk_index           │
+└─────────────────────────────────────────────────────────┘
+```
 
 ### 4. 故障隔离
 
@@ -116,586 +138,310 @@ class IssueProcessor:
 OpenClaw 不可用 → 使用本地规则分类
 KB Service 不可用 → 跳过知识库查询
 Ollama 不可用 → 返回错误，不执行代码修改
+ChromaDB 损坏 → 重新同步 GitHub 仓库重建
 ```
 
 ---
 
-## 分层架构
+## 知识库架构
 
-### Layer 1: 基础设施层 (Infrastructure)
+### 存储架构
 
-**职责：** 提供基础服务，与业务逻辑无关
-
-| 模块 | 职责 |
-|------|------|
-| `config/` | 配置管理、环境变量、配置验证 |
-| `utils/` | 重试机制、错误定义、通用工具 |
-
-### Layer 2: 服务层 (Service)
-
-**职责：** 封装外部服务交互
-
-| 模块 | 职责 | 设计要点 |
-|------|------|---------|
-| `github_api/github_client.py` | GitHub REST API 调用 | Token 自动刷新、错误处理 |
-| `github_api/auth_manager.py` | JWT 认证 | 私钥缓存、Token 生命周期管理 |
-
-**认证流程：**
-
-```
-Webhook 请求
-    ↓
-提取 Installation ID
-    ↓
-AuthManager.get_token(installation_id)
-    ├─ 检查缓存的 Token
-    ├─ 如果过期，使用私钥生成新 JWT
-    └─ 使用 JWT 换取 Installation Token
-    ↓
-返回 Token 给 GitHubClient 使用
-```
-
-### Layer 3: 智能层 (Intelligence)
-
-**职责：** AI/ML 相关功能
-
-#### 3.1 意图识别 (Cloud Agent)
-
-**四种意图类型：**
-
-| 意图 | 说明 | 置信度阈值 |
-|------|------|-----------|
-| `answer` | 用户询问解释 | > 0.7 |
-| `modify` | 用户要求修改代码 | > 0.8 |
-| `research` | 需要查询资料 | > 0.7 |
-| `clarify` | 需要澄清 | 任意 |
-
-#### 3.2 知识库 (Knowledge Base)
-
-**职责：** RAG 检索增强
-
-**GitHub 知识库同步架构：**
-
-```
-┌─────────────────┐      ┌──────────────────┐      ┌─────────┐
-│  GitHub Repo    │      │  KB Sync Tools   │      │ KB Svc  │
-│                 │      │                  │      │         │
-│  chips/         │─────▶│  Repo Watcher    │─────▶│ Chroma  │
-│  ├── SD3031.pdf │ pull │  (Poll/Webhook)  │      │ Vector  │
-│  └── DS3231.md  │      │                  │      │ Store   │
-│                 │      │  PDF Processor   │      │         │
-│  best_practices/│─────▶│  (多线程并行)     │─────▶│ Embed   │
-│  └── guide.md   │      │                  │      │ (Ollama)│
-└─────────────────┘      └──────────────────┘      └─────────┘
-```
-
-**同步流程（PDF 直接处理 - 方案 A）：**
-1. 检测更新（轮询/Webhook）
-2. 下载文件到本地
-3. **PDF**: 按页解析 → 多线程并行生成 embedding → 直接存储（不再转 Markdown）
-4. **MD/TXT**: 格式转换 → Markdown 存储（**TODO**: 后续将优化为直接存储模式，与 PDF 统一）
-5. 增量更新向量库
-
-**PDF 处理架构（多线程并行）：**
-
-```
-PDF 文件 (110 页)
-    ↓
-┌─────────────────────────────────────────┐
-│        PDFProcessor (pdfplumber)        │
-│  解析: 逐页提取文本 + 元数据              │
-└─────────────────────────────────────────┘
-    ↓
-┌─────────────────────────────────────────┐
-│      多线程并行处理 (默认 8 线程)         │
-│  ┌─────┐ ┌─────┐ ┌─────┐ ... ┌─────┐  │
-│  │Page1│ │Page2│ │Page3│     │PageN│  │
-│  │嵌入 │ │嵌入 │ │嵌入 │     │嵌入 │  │
-│  └──┬──┘ └──┬──┘ └──┬──┘     └──┬──┘  │
-│     └───────┴───────┴───────────┘      │
-│              线程池执行                  │
-└─────────────────────────────────────────┘
-    ↓
-┌─────────────────────────────────────────┐
-│        ChromaDB (持久化存储)            │
-│  {chip: "bmi160", page: 45, ...}        │
-└─────────────────────────────────────────┘
-```
-
-**性能优化：**
-| 优化项 | 配置 | 效果 |
-|--------|------|------|
-| 多线程并行 | `KB_PDF_WORKERS=8` | 8 线程同时处理多页 |
-| 并行阈值 | `KB_PDF_PARALLEL_THRESHOLD=3` | 3页以上启用并行 |
-| 后台处理 | 启动时异步加载 | 不阻塞服务启动 |
-| 自动线程数 | CPU核心数/3 | 24核 → 8 线程 |
-
-**向量检索优化（HNSW）：**
+采用**单一存储后端** - ChromaDB 向量数据库：
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                  Vector Store Architecture               │
+│                     ChromaDB                            │
+│              (Persistent Vector Store)                  │
 ├─────────────────────────────────────────────────────────┤
-│  ┌──────────────┐      ┌─────────────────────────────┐ │
-│  │ SimpleStore  │      │      HNSWVectorStore        │ │
-│  │  (暴力搜索)   │      │    (近似最近邻 O(log n))     │ │
-│  │              │      │                             │ │
-│  │  O(n) 线性   │      │  Hierarchical Navigable     │ │
-│  │  小数据量    │◀─────│  Small World Graph          │ │
-│  │  (<1000)     │ 降级  │                             │ │
-│  └──────────────┘      │  • 构建: O(n log n)         │ │
-│                        │  • 查询: O(log n)           │ │
-│                        │  • 精度: >95%               │ │
-│                        │  • 加速比: ~750x            │ │
-│                        └─────────────────────────────┘ │
+│  Collection: knowledge_base                             │
+│  - 自动持久化到磁盘                                     │
+│  - 内置 HNSW 索引                                       │
+│  - 支持增量更新                                         │
+├─────────────────────────────────────────────────────────┤
+│  Document Structure:                                    │
+│  {                                                      │
+│    id: "doc_hash",                                      │
+│    text: "document content",                            │
+│    embedding: [0.1, -0.2, ...],  # 768/1024/384 dim   │
+│    metadata: {                                          │
+│      source: "path/to/file.pdf",                        │
+│      doc_type: "pdf|document",                          │
+│      page: 42,              # PDF页码                   │
+│      chunk_index: 1,        # 文档分段索引              │
+│      total_chunks: 5,       # 总段数                    │
+│      category: "chip_doc|best_practice",                │
+│      file_ext: ".pdf|.md|.txt|.docx",                  │
+│      vendor: "espressif",   # 芯片厂商                  │
+│      chip: "esp32",         # 芯片型号                  │
+│      processed_at: timestamp                            │
+│    }                                                    │
+│  }                                                      │
 └─────────────────────────────────────────────────────────┘
 ```
 
-| 存储后端 | 时间复杂度 | 适用规模 | 性能 (5000 docs) |
-|---------|-----------|---------|-----------------|
-| SimpleVectorStore | O(n) | < 1000 文档 | ~161ms/查询 |
-| **HNSWVectorStore** | **O(log n)** | **1万+ 文档** | **~0.21ms/查询** |
+### 文件类型处理
 
-**配置参数：**
-```bash
-KB_USE_HNSW=true                    # 启用 HNSW（默认）
-KB_HNSW_EF_CONSTRUCTION=200         # 构建精度
-KB_HNSW_M=16                        # 节点连接数
-KB_HNSW_EF=50                       # 查询精度
-```
+| 文件类型 | 解析方式 | 存储粒度 | 特殊处理 |
+|---------|---------|---------|---------|
+| **PDF** | PyMuPDF | 按页 | 多线程并行处理 |
+| **Markdown** | 直接读取 | 整篇（或分段） | 保留格式 |
+| **TXT** | 包装为 Markdown | 整篇（或分段） | 添加代码块标记 |
+| **DOCX** | python-docx/pandoc | 整篇（或分段） | 提取纯文本 |
 
-#### 3.3 代码执行 (Code Executor)
+### 不再使用的存储方式
 
-**职责：** 安全地生成和执行代码修改
+以下目录**不再用于存储同步的文件**，仅保留代码兼容性：
 
-```python
-class CodeExecutor:
-    def execute_task(self, task) -> ExecutionResult:
-        # 1. 克隆仓库
-        repo_path = self.repo_manager.clone(url)
-        
-        # 2. 创建分支
-        self.repo_manager.create_branch(branch_name)
-        
-        # 3. 生成修改
-        changes = self.code_generator.generate(instruction)
-        
-        # 4. 安全应用
-        self.safe_modifier.apply(changes)
-        
-        # 5. 验证
-        self.validator.validate(changes)
-        
-        # 6. 提交推送
-        self.repo_manager.commit_and_push(message)
-```
-
-**安全修改机制：**
-
-```
-传统方式 (危险):
-AI 生成完整文件 → 直接覆盖原文件 → 可能丢失未提及的代码
-
-安全方式 (SEARCH/REPLACE):
-AI 生成 SEARCH/REPLACE 块 → 精确匹配替换 → 只修改指定部分
-```
-
-### Layer 4: 核心层 (Core)
-
-**职责：** 业务流程编排
-
-```python
-class IssueProcessor:
-    def process_event(self, event: GitHubEvent) -> ProcessingResult:
-        # 1. 构建上下文
-        context = self.context_builder.build(event)
-        
-        # 2. 意图识别
-        intent = self.cloud_agent.classify(context)
-        
-        # 3. 检查关闭指令（如"已解决"）
-        if self._is_close_request(context):
-            return self._close_issue(...)
-        
-        # 4. 执行对应处理
-        if intent == IntentType.MODIFY:
-            return self._handle_modify(...)
-        elif intent == IntentType.RESEARCH:
-            return self._handle_research(...)
-        # ...
-```
-
-### Layer 5: 表现层 (Presentation)
-
-**职责：** 接收外部请求
-
-```python
-@app.route("/webhook/github", methods=["POST"])
-def github_webhook():
-    # 1. 验证签名
-    if not verify_signature(request):
-        return "Invalid signature", 401
-    
-    # 2. 解析事件
-    event = parse_event(request)
-    
-    # 3. 异步处理
-    threading.Thread(target=processor.process_event, args=(event,)).start()
-    
-    return "OK", 200
-```
+| 目录 | 原用途 | 当前状态 |
+|------|--------|---------|
+| `knowledge_base/chips/` | 芯片文档本地存储 | 不再写入文件 |
+| `knowledge_base/best_practices/` | 最佳实践本地存储 | 不再写入文件 |
+| `knowledge_base/data/` | 案例数据存储 | 保留（成功案例库） |
 
 ---
 
 ## 数据流
 
-### 完整处理流程
+### 知识库同步流程
 
 ```
-┌─────────────┐
-│ GitHub      │ Issue/Comment 事件
-│ Webhook     │
-└──────┬──────┘
-       │
-       ▼
-┌─────────────┐
-│ Webhook     │ 1. 验证签名
-│ Server      │ 2. 解析事件
-│             │ 3. 防重复检查
-└──────┬──────┘
-       │
-       ▼
-┌─────────────┐
-│ Core        │ 4. 构建上下文
-│ Processor   │ 5. 检查触发模式
-│             │ 6. 检查关闭指令
-└──────┬──────┘
-       │
-       ├───────────────────────────────────────────┐
-       │                                           │
-       ▼                                           ▼
-┌─────────────┐                           ┌─────────────┐
-│ Cloud Agent │                           │ Knowledge   │
-│ (OpenClaw)  │                           │ Base        │
-│             │                           │ (Optional)  │
-│ Intent      │                           │             │
-│ Classification│                         │ Query       │
-└──────┬──────┘                           └─────────────┘
-       │
-       ▼
-┌─────────────┐
-│ Decision    │ 7. 制定行动计划
-│ Engine      │    - 确认模式
-│             │    - Issue 跟踪
-└──────┬──────┘
-       │
-       ├──────────┬──────────┬──────────┐
-       │          │          │          │
-       ▼          ▼          ▼          ▼
-   ┌───────┐ ┌───────┐ ┌───────┐ ┌───────┐
-   │answer │ │modify │ │research│ │clarify│
-   │       │ │       │ │       │ │       │
-   │Reply  │ │Create │ │Search │ │Ask    │
-   │Comment│ │PR     │ │KB     │ │Question│
-   └───┬───┘ └───┬───┘ └───┬───┘ └───┬───┘
-       │         │         │         │
-       └─────────┴────┬────┴─────────┘
-                      │
-                      ▼
-              ┌─────────────┐
-              │ GitHub API  │ 8. 发送响应
-              │             │    - Create comment
-              │             │    - Create PR
-              │             │    - Close issue
-              └─────────────┘
+GitHub 仓库 (knowledge-base)
+    │
+    │ 1. Webhook 推送 / 定时拉取
+    ▼
+┌─────────────────────────────────────┐
+│  github_repo_watcher.py             │
+│  - 检测文件变更                      │
+│  - 对比 SHA/检查向量库               │
+└─────────────────────────────────────┘
+    │
+    │ 2. 下载到临时目录 (WORKDIR)
+    ▼
+┌─────────────────────────────────────┐
+│  临时文件处理                        │
+│  /home/tj/github-agent-v2/          │
+│  └── github_kb_sync/                │
+│      ├── temp_xxx.pdf               │
+│      ├── temp_xxx.md                │
+│      └── ...                        │
+└─────────────────────────────────────┘
+    │
+    │ 3. 文本提取与分段
+    ▼
+┌─────────────────────────────────────┐
+│  文档处理器                          │
+│  - PDF: PyMuPDF 解析 (110页/s)       │
+│  - MD/TXT/DOCX: 提取文本             │
+│  - 长文档自动分段 (2000字符/段)       │
+└─────────────────────────────────────┘
+    │
+    │ 4. 并行生成 Embedding
+    ▼
+┌─────────────────────────────────────┐
+│  Embedding 生成器                    │
+│  - Ollama API (bge-m3/nomic)         │
+│  - 批量请求，连接池优化               │
+│  - 4-8 线程并发                      │
+└─────────────────────────────────────┘
+    │
+    │ 5. 存入 ChromaDB
+    ▼
+┌─────────────────────────────────────┐
+│  ChromaDB                            │
+│  /home/tj/chroma_db/                 │
+│  - 向量存储                          │
+│  - 元数据索引                        │
+│  - HNSW 近似检索                     │
+└─────────────────────────────────────┘
+    │
+    │ 6. 清理临时文件
+    ▼
+[完成]
+```
+
+### 知识库查询流程
+
+```
+用户 Issue/评论
+    │
+    │ "@agent SD3031 如何读取温度？"
+    ▼
+┌─────────────────────────────────────┐
+│  意图识别                            │
+│  - 关键词匹配                        │
+│  - OpenClaw 分类                     │
+└─────────────────────────────────────┘
+    │
+    │ 识别为: knowledge_query
+    ▼
+┌─────────────────────────────────────┐
+│  知识检索                            │
+│  1. 生成查询 embedding               │
+│  2. ChromaDB 相似度搜索              │
+│  3. 返回 Top-K 结果                  │
+└─────────────────────────────────────┘
+    │
+    │ 检索到: SD3031 数据手册 p23
+    ▼
+┌─────────────────────────────────────┐
+│  答案生成                            │
+│  - 结合检索结果                      │
+│  - Ollama 生成回复                   │
+└─────────────────────────────────────┘
+    │
+    ▼
+GitHub Issue 回复
 ```
 
 ---
 
 ## 关键技术决策
 
-### 1. 双模型架构
+### 1. 为什么使用 ChromaDB 作为唯一存储？
 
-| 任务 | 模型 | 部署位置 | 原因 |
-|------|------|---------|------|
-| 意图识别 | kimi-k2.5 (via OpenClaw) | 云端 | 需要强大的推理能力，不涉及敏感代码 |
-| 代码生成 | qwen3-coder:30b (via Ollama) | 本地 | 代码不出境，保证安全 |
+| 考虑因素 | 决策 | 原因 |
+|---------|------|------|
+| 存储一致性 | ✅ 统一存储 | 避免本地文件和向量库数据不一致 |
+| 查询效率 | ✅ 向量检索 | HNSW 算法 O(log n) 复杂度 |
+| 部署简化 | ✅ 单后端 | 无需维护两套存储系统 |
+| 可移植性 | ✅ 文件级 | ChromaDB 目录可直接复制迁移 |
+| 可靠性 | ✅ 自动持久化 | 数据不丢失，支持备份 |
 
-### 2. SEARCH/REPLACE 安全修改
+### 2. 为什么 PDF 和其他文件统一处理？
 
-**好处：**
-- 精确修改，不误删
-- 可验证，不匹配时拒绝执行
-- 便于人工审查
+**之前的问题：**
+- PDF → 直接存 ChromaDB
+- Markdown/TXT/DOCX → 存本地文件 → KB Service 启动时加载 → ChromaDB
 
-### 3. 异步处理
+**问题：**
+1. 数据不一致风险（本地文件 vs 向量库）
+2. 启动时需要加载本地文件，增加启动时间
+3. 路径管理复杂（本地路径 vs 向量存储路径）
 
-**好处：**
-- GitHub 不会超时重试
-- 可以处理耗时操作（代码生成）
-- 提高响应速度
+**统一后的优势：**
+1. 所有文件类型同流程处理
+2. 启动时直接读取 ChromaDB，无需加载本地文件
+3. 简化架构，易于维护
 
-### 4. 状态持久化
+### 3. PyMuPDF vs pdfplumber
 
-使用本地 JSON 文件保存 Issue 状态：
-- 简单，无需外部数据库
-- 易于调试和审计
-- 可手动修改状态
+| 特性 | pdfplumber | PyMuPDF |
+|------|-----------|---------|
+| 解析速度 | ~1页/s | ~70页/s |
+| 内存占用 | 较高 | 较低 |
+| 功能丰富度 | 高（表格识别等） | 中等 |
+| 依赖复杂度 | 较高 | 较低 |
+| 适用场景 | 复杂布局 | 快速文本提取 |
 
-### 5. Issue 跟踪功能
+**选择 PyMuPDF**：知识库场景只需要快速文本提取，不需要复杂布局分析。
 
-**设计要点：**
-- 评论 ID 去重，防止 Webhook 重复处理
-- 5 秒处理窗口，防止短时间内重复处理
-- 检测关闭关键词（"已解决"、"fixed" 等）
-- 可配置开关（`AGENT_ISSUE_TRACKING_ENABLED`）
+### 4. 为什么分段存储长文档？
 
----
+**问题**：Ollama embedding 模型通常有 token 限制（512-2048 tokens）
 
-## 代码修改设计详解
+**解决方案**：
+- 长文档自动分段（默认 2000 字符/段）
+- 每段独立生成 embedding
+- 检索时返回最相关的段落
 
-### 设计目标
-
-1. **安全性**：代码修改必须精确、可验证、不会误删
-2. **可审查性**：修改过程透明，便于人工审查
-3. **容错性**：修改失败时有安全回退机制
-4. **效率性**：支持大文件和复杂修改场景
-
-### 整体流程
-
-```
-用户 Issue 指令
-     ↓
-[CodeExecutor.execute_task]
-     ↓
-1. 克隆/更新仓库 → 2. 创建分支
-     ↓
-3. 分析需要修改的文件（AI 分析或用户指定）
-     ↓
-4. 循环处理每个文件
-     ↓
-[SafeCodeModifier.modify_file]
-     ↓
-文件 <= 100 行? ──YES──→ _precise_replace (精确替换)
-     │
-    NO
-     ↓
-_chunked_modify (分段处理)
-     ↓
-5. 验证修改 → 6. 提交推送 → 7. 创建 PR
-```
-
-### 核心组件
-
-#### 1. CodeGenerator（代码生成器）
-
-**职责**：与本地 Ollama 模型交互，生成代码和修改建议
-
-| 方法 | 用途 | 温度参数 | 说明 |
-|------|------|----------|------|
-| `generate_modification` | 单文件修改 | 0.3 | 生成完整文件内容 |
-| `generate_multi_file_modification` | 多文件修改 | 0.2 | 返回 JSON 数组 |
-| `analyze_issue_complexity` | 复杂度分析 | 0.1 | 评估修改难度和范围 |
-
-**模型参数自适应**：
-```python
-if "30b" in model or "32b" in model:
-    num_ctx = 131072  # 128K 上下文
-    num_predict = 8000
-elif "14b" in model:
-    num_ctx = 32768   # 32K 上下文
-    num_predict = 6000
-else:
-    num_ctx = 16384   # 16K 上下文
-    num_predict = 4000
-```
-
-#### 2. SafeCodeModifier（安全修改器）
-
-**核心设计：SEARCH/REPLACE 精确匹配**
-
-与传统全文替换相比的优势：
-
-```
-传统方式（危险）:
-AI 生成完整文件 → 直接覆盖原文件
-→ 可能丢失 AI 未提及的代码
-→ 无法验证修改范围
-
-SEARCH/REPLACE 方式（安全）:
-AI 生成 SEARCH/REPLACE 块 → 精确匹配替换
-→ 只修改明确指定的部分
-→ 不匹配时拒绝执行（安全回退）
-→ 便于人工审查修改内容
-```
-
-**处理策略：**
-
-##### 小文件处理（<=100行）：`_precise_replace`
-
-```
-构建 SEARCH/REPLACE 提示词
-     ↓
-AI 生成格式：
-  SEARCH:
-  ```
-  要查找的代码（包含3-5行上下文）
-  ```
-  REPLACE:
-  ```
-  新代码
-  ```
-     ↓
-验证：SEARCH 是否存在于原文件？
-     ↓
-YES → 执行替换 → 验证内容变化 → 返回
-NO  → 抛出异常（安全回退）
-```
-
-##### 大文件处理（>100行）：`_chunked_modify`
-
-```
-第一步：AI 分析需要修改的行号范围
-  ↓
-第二步：对每个修改区域：
-  - 提取上下文（前后各3行）
-  - 调用 _ai_assisted_replace（精确替换）
-  ↓
-第三步：合并所有修改回原文件
-  ↓
-返回修改后的完整内容
-```
-
-**关键安全机制：**
-
-1. **匹配验证**：SEARCH 必须在原文件中精确存在
-2. **变化验证**：修改后内容必须与原始内容不同
-3. **语法验证**：通过 ChangeValidator 检查代码语法
-4. **失败回退**：任何步骤失败时返回原始内容
-
-#### 3. CodeExecutor（执行器主类）
-
-**执行流程：**
-
-```python
-execute_task():
-  # Step 1: 准备环境
-  1.1 克隆/更新仓库
-  1.2 创建分支 agent-fix-{issue_number}
-  
-  # Step 2: 确定修改范围
-  2.1 如果用户指定了 files_to_modify：直接使用
-  2.2 否则：AI 分析仓库文件，选择需要修改的文件
-  
-  # Step 3: 执行修改
-  3.1 遍历每个目标文件
-  3.2 获取原始内容
-  3.3 调用 SafeCodeModifier.modify_file()
-  3.4 验证修改（语法 + 内容变化）
-  3.5 写入文件
-  
-  # Step 4: 提交和 PR
-  4.1 提交并推送分支
-  4.2 创建 Pull Request
-  4.3 返回执行结果
-```
-
-### 关键技术决策
-
-#### 1. 为什么使用 SEARCH/REPLACE？
-
-| 对比项 | 全文替换 | SEARCH/REPLACE |
-|--------|----------|----------------|
-| 安全性 | ❌ 可能误删 | ✅ 精确匹配 |
-| 可验证性 | ❌ 无法验证 | ✅ 匹配失败拒绝 |
-| 可审查性 | ❌ 需对比全文 | ✅ 明确修改点 |
-| 失败恢复 | ❌ 难以恢复 | ✅ 安全回退 |
-
-#### 2. 文件大小分层的考虑
-
-- **小文件（<=100行）**：完整内容送入 AI，上下文充足，一次生成修改
-- **大文件（>100行）**：分段处理，避免 AI 注意力分散，减少 token 消耗
-
-#### 3. 温度参数选择
-
-| 场景 | 温度 | 原因 |
-|------|------|------|
-| 分析类任务 | 0.1 | 确定性高，减少随机性 |
-| 代码生成 | 0.2-0.3 | 适度创造性，保持稳定性 |
-
-#### 4. 错误处理策略
-
-```
-修改失败时：
-  1. 记录详细错误日志
-  2. 返回原始内容（不破坏原有代码）
-  3. 标记该文件修改失败
-  4. 继续处理其他文件（部分成功优于全部失败）
-```
-
-### 当前局限性与优化方向
-
-#### 已知局限
-
-1. **SEARCH 匹配问题**
-   - AI 生成的 SEARCH 可能与原文件不完全匹配
-   - 常见原因：空白字符差异、换行符、AI 省略代码
-
-2. **大文件 chunk 边界**
-   - 分段修改时，多个 chunk 可能相互影响
-   - 行号分析可能不够精确
-
-3. **缺乏反馈循环**
-   - 如果修改失败，没有自动重试或修正机制
-
-#### 优化方向
-
-1. **模糊匹配**：允许一定程度的空白字符差异
-2. **反馈循环**：SEARCH 不匹配时，让 AI 重新生成
-3. **AST 分析**：使用语法树确定修改范围，而非行号
-4. **测试验证**：修改后自动运行相关测试用例
-5. **多轮对话**：分析→生成→验证→修正，多轮迭代
+**优势**：
+- 避免截断导致信息丢失
+- 提高检索精度（段落级匹配）
+- 支持超长文档（100+ 页 PDF）
 
 ---
 
-## 安全设计
+## 配置说明
 
-### 1. Webhook 签名验证
+### 核心环境变量
 
-```python
-def verify_signature(payload: bytes, signature: str, secret: str) -> bool:
-    expected = 'sha256=' + hmac.new(
-        secret.encode(),
-        payload,
-        hashlib.sha256
-    ).hexdigest()
-    return hmac.compare_digest(expected, signature)
+```bash
+# ChromaDB 存储路径（所有文档统一存储）
+KB_CHROMA_DIR=/home/tj/chroma_db
+
+# 工作目录（临时文件下载）
+GITHUB_AGENT_WORKDIR=/home/tj/github-agent-v2
+
+# 同步状态文件目录
+GITHUB_AGENT_STATEDIR=/home/tj/state
+
+# 嵌入模型配置
+KB_EMBEDDING_MODEL=bge-m3:latest
+KB_EMBEDDING_HOST=http://localhost:11434
+
+# PDF 处理线程数（默认 CPU/4）
+KB_PDF_WORKERS=4
+
+# 以下变量保留兼容性，但不再用于文件存储
+# KB_CHIPS_DIR=./knowledge_base/chips        # 不再使用
+# KB_PRACTICES_DIR=./knowledge_base/best_practices  # 不再使用
 ```
 
-### 2. 代码修改安全
+### 目录结构
 
-| 安全措施 | 说明 |
-|---------|------|
-| SEARCH/REPLACE | 精确匹配，不匹配时拒绝 |
-| 语法验证 | 修改后验证 Python/JSON 语法 |
-| 文件大小限制 | 超过限制拒绝处理 |
-| 扩展名白名单 | 只允许修改指定类型文件 |
-| 最大文件数 | 单个 PR 限制修改文件数量 |
+```
+/home/tj/
+├── chroma_db/                    # ChromaDB 向量存储
+│   ├── chroma.sqlite3
+│   └── ...
+├── github-agent-v2/              # 工作目录（临时文件）
+│   └── github_kb_sync/           # 同步临时目录
+│       └── temp_*.pdf/md/txt
+└── state/                        # 同步状态
+    └── .github_kb_sync_state.json
+```
 
-### 3. 权限控制
+### 性能指标
 
-- 使用 GitHub App 最小权限原则
-- 只请求必要的权限 (Issues, Pull requests)
-- Token 短期有效（1小时）
+| 指标 | 优化前 | 优化后 | 提升 |
+|------|--------|--------|------|
+| PDF 解析速度 | ~1页/s | ~70页/s | **70x** |
+| PDF 处理总时间 | ~60s/110页 | ~10s/110页 | **6x** |
+| 服务启动时间 | ~30s | ~3s | **10x** |
+| 知识库检索 | ~161ms | ~0.21ms | **750x** |
 
 ---
 
-## 总结
+## 附录
 
-GitHub Agent V2 的架构设计遵循以下核心理念：
+### A. 文件类型处理详情
 
-1. **分层清晰** - 每层职责单一，便于维护和测试
-2. **松耦合** - 模块间通过接口交互，可独立演进
-3. **容错性** - 每个外部依赖都有降级方案
-4. **可扩展** - 易于添加新功能和新集成
-5. **安全性** - 多层安全机制保护代码和数据
+#### PDF 处理流程
+```python
+1. PyMuPDF.open(pdf_path)
+2. 遍历每页: page.get_text()
+3. 清理文本
+4. 生成 embedding (bge-m3: 1024维)
+5. 存入 ChromaDB (metadata: page, vendor, chip)
+```
+
+#### Markdown/TXT/DOCX 处理流程
+```python
+1. 提取文本内容
+   - MD: 直接读取
+   - TXT: 包装为 Markdown 代码块
+   - DOCX: python-docx/pandoc 提取
+2. 长文档分段（2000字符/段）
+3. 每段生成 embedding
+4. 存入 ChromaDB (metadata: chunk_index, total_chunks)
+```
+
+### B. 故障恢复
+
+**场景：ChromaDB 数据损坏**
+```bash
+# 1. 停止服务
+pkill -f kb_service
+
+# 2. 删除损坏的 ChromaDB
+rm -rf /home/tj/chroma_db
+
+# 3. 重新同步
+python scripts/github_repo_watcher.py --sync
+
+# 4. 启动服务
+python -m knowledge_base.kb_service
+```
+
+**数据不会丢失**：所有源文件都在 GitHub 仓库，可随时重新同步。

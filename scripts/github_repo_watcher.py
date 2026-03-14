@@ -489,6 +489,154 @@ class GitHubRepoWatcher:
             logger.error(f"❌ 转换失败 {input_path}: {e}")
             return False
     
+    def _extract_text_content(self, file_path: Path, ext: str) -> str:
+        """从文件中提取文本内容"""
+        try:
+            if ext == '.md':
+                # Markdown 直接读取
+                return file_path.read_text(encoding='utf-8')
+                
+            elif ext == '.txt':
+                # 文本文件包装为 Markdown
+                content = file_path.read_text(encoding='utf-8')
+                return f"# {file_path.stem}\n\n```\n{content}\n```\n"
+                
+            elif ext == '.docx':
+                # Word 文档转换
+                try:
+                    # 尝试使用 pandoc
+                    result = subprocess.run(
+                        ["pandoc", str(file_path), "-t", "markdown"],
+                        capture_output=True,
+                        text=True,
+                        timeout=30
+                    )
+                    if result.returncode == 0:
+                        return result.stdout
+                    else:
+                        raise RuntimeError("pandoc failed")
+                except FileNotFoundError:
+                    # pandoc 未安装，使用 python-docx
+                    from docx import Document
+                    doc = Document(file_path)
+                    content = "\n".join([para.text for para in doc.paragraphs])
+                    return f"# {file_path.stem}\n\n{content}\n"
+            else:
+                # 其他类型尝试直接读取文本
+                return file_path.read_text(encoding='utf-8', errors='ignore')
+                
+        except Exception as e:
+            logger.error(f"提取文本失败 {file_path}: {e}")
+            return ""
+    
+    def _process_document_directly(self, file_path: Path, original_path: str, 
+                                   ext: str, is_update: bool = False) -> bool:
+        """
+        直接处理文档文件（Markdown/TXT/DOCX）存入 ChromaDB
+        
+        Args:
+            file_path: 临时文件路径
+            original_path: 原始文件路径（用于元数据）
+            ext: 文件扩展名
+            is_update: 是否是更新
+        """
+        try:
+            logger.info(f"📄 直接处理文档: {file_path.name}")
+            
+            # 延迟导入，避免循环依赖
+            from knowledge_base.kb_service import SimpleEmbedding, ChromaVectorStore
+            
+            # 初始化组件
+            embedder = SimpleEmbedding(
+                model=os.environ.get("KB_EMBEDDING_MODEL", "nomic-embed-text"),
+                host=os.environ.get("KB_EMBEDDING_HOST", "http://localhost:11434")
+            )
+            vector_store = ChromaVectorStore()
+            
+            # 如果是更新，先删除旧向量
+            if is_update:
+                logger.info(f"   🗑️  检测到更新，清理旧向量: {original_path}")
+                try:
+                    vector_store.delete_by_source(original_path)
+                except Exception as e:
+                    logger.warning(f"   ⚠️  清理旧向量失败: {e}")
+            
+            # 提取文本内容
+            content = self._extract_text_content(file_path, ext)
+            if not content.strip():
+                logger.warning(f"   ⚠️ 文档内容为空: {original_path}")
+                return False
+            
+            # 分段处理（如果内容很长）
+            max_chunk_size = 2000  # 每段最大字符数
+            chunks = []
+            
+            if len(content) <= max_chunk_size:
+                chunks = [content]
+            else:
+                # 按段落分割
+                paragraphs = content.split('\n\n')
+                current_chunk = ""
+                for para in paragraphs:
+                    if len(current_chunk) + len(para) + 2 <= max_chunk_size:
+                        current_chunk += para + "\n\n"
+                    else:
+                        if current_chunk:
+                            chunks.append(current_chunk.strip())
+                        current_chunk = para + "\n\n"
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+            
+            logger.info(f"   📝 文档分段: {len(chunks)} 段")
+            
+            # 生成 embedding 并存入 ChromaDB
+            stored_count = 0
+            for idx, chunk in enumerate(chunks, 1):
+                try:
+                    embedding = embedder.embed(chunk[:2000])
+                    
+                    # 构建元数据
+                    metadata = {
+                        "source": original_path,
+                        "chunk_index": idx,
+                        "total_chunks": len(chunks),
+                        "doc_type": "document",
+                        "file_ext": ext,
+                        "content_preview": chunk[:200],
+                        "processed_at": time.time()
+                    }
+                    
+                    # 添加芯片/类别信息
+                    path_lower = original_path.lower()
+                    if any(keyword in path_lower for keyword in ["chip", "芯片", "hardware", "datasheet"]):
+                        metadata["category"] = "chip_doc"
+                    else:
+                        metadata["category"] = "best_practice"
+                    
+                    vector_store.add_with_embedding(
+                        text=chunk,
+                        embedding=embedding,
+                        metadata=metadata
+                    )
+                    stored_count += 1
+                    
+                except Exception as e:
+                    logger.warning(f"   ⚠️ 段落 {idx} 处理失败: {e}")
+            
+            if stored_count > 0:
+                action = "更新" if is_update else "新增"
+                logger.info(f"   ✅ 文档 {action}完成: {stored_count}/{len(chunks)} 段已存储")
+                return True
+            else:
+                logger.warning(f"   ⚠️ 文档未存储任何段落")
+                return False
+                
+        except Exception as e:
+            logger.error(f"   ❌ 文档直接处理失败: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return False
+    
     def sync_files(self, files: List[Dict], force: bool = False) -> dict:
         """同步文件到知识库
         
@@ -530,40 +678,24 @@ class GitHubRepoWatcher:
             is_update = file_path in sync_state
             
             if not force and file_sha == sync_state.get(file_path):
-                # SHA 匹配
-                if is_pdf:
-                    # PDF：检查向量库中是否已存在
-                    from knowledge_base.kb_service import ChromaVectorStore
-                    try:
-                        vs = ChromaVectorStore()
-                        existing = vs.collection.get(
-                            where={"source": file_path},
-                            limit=1
-                        )
-                        if existing['ids']:
-                            logger.info(f"  [{i}/{len(files)}] ⏭️  跳过（PDF 已同步）: {file_path}")
-                            stats['skipped'] += 1
-                            stats['details'].append({'file': file_path, 'status': 'skipped', 'type': 'pdf'})
-                            continue
-                        else:
-                            logger.info(f"  [{i}/{len(files)}] 📝 重新处理（向量缺失）: {file_path}")
-                    except Exception:
-                        logger.info(f"  [{i}/{len(files)}] 📝 重新处理（无法验证向量）: {file_path}")
-                else:
-                    # Markdown：检查本地文件
-                    target_name = Path(file_path).stem + ".md"
-                    if "chip" in file_path.lower() or "芯片" in file_path:
-                        local_path = KB_CHIPS_DIR / target_name
-                    else:
-                        local_path = KB_PRACTICES_DIR / target_name
-                    
-                    if local_path.exists():
+                # SHA 匹配，检查向量库中是否已存在
+                from knowledge_base.kb_service import ChromaVectorStore
+                try:
+                    vs = ChromaVectorStore()
+                    existing = vs.collection.get(
+                        where={"source": file_path},
+                        limit=1
+                    )
+                    if existing['ids']:
+                        file_type = 'pdf' if is_pdf else 'document'
                         logger.info(f"  [{i}/{len(files)}] ⏭️  跳过（已同步）: {file_path}")
                         stats['skipped'] += 1
-                        stats['details'].append({'file': file_path, 'status': 'skipped'})
+                        stats['details'].append({'file': file_path, 'status': 'skipped', 'type': file_type})
                         continue
                     else:
-                        logger.info(f"  [{i}/{len(files)}] 📝 重新下载（本地缺失）: {file_path}")
+                        logger.info(f"  [{i}/{len(files)}] 📝 重新处理（向量缺失）: {file_path}")
+                except Exception:
+                    logger.info(f"  [{i}/{len(files)}] 📝 重新处理（无法验证向量）: {file_path}")
             
             status_icon = "🆕" if file_path not in sync_state else "📝"
             logger.info(f"  [{i}/{len(files)}] {status_icon} 处理中: {file_path}")
@@ -592,26 +724,18 @@ class GitHubRepoWatcher:
                     stats['failed'] += 1
                     stats['details'].append({'file': file_path, 'status': 'failed', 'reason': 'pdf_process'})
             else:
-                # 其他文件（Markdown/TXT）转换为 Markdown 保存
-                path_lower = file_path.lower()
-                if any(keyword in path_lower for keyword in ["chip", "芯片", "hardware", "datasheet"]):
-                    target_dir = KB_CHIPS_DIR
-                else:
-                    target_dir = KB_PRACTICES_DIR
-                
-                target_name = Path(file_path).stem + ".md"
-                target_path = target_dir / target_name
-                
-                if self.convert_to_markdown(temp_file, target_path):
+                # 其他文件（Markdown/TXT/DOCX）直接处理存入 ChromaDB
+                if self._process_document_directly(temp_file, file_path, ext, is_update=is_update):
                     sync_state[file_path] = file_sha
                     stats['success'] += 1
-                    stats['details'].append({'file': file_path, 'status': 'success', 'type': 'markdown'})
+                    action_type = 'doc_update' if is_update else 'doc_new'
+                    stats['details'].append({'file': file_path, 'status': 'success', 'type': action_type})
                 else:
-                    logger.error(f"       ❌ 转换失败: {file_path}")
+                    logger.error(f"       ❌ 文档处理失败: {file_path}")
                     stats['failed'] += 1
-                    stats['details'].append({'file': file_path, 'status': 'failed', 'reason': 'convert'})
+                    stats['details'].append({'file': file_path, 'status': 'failed', 'reason': 'doc_process'})
             
-            # 清理临时文件（注意：PDF处理需要自己负责清理，因为它可能是异步的）
+            # 清理临时文件（PDF处理自己负责清理）
             if ext != '.pdf':
                 temp_file.unlink(missing_ok=True)
         
@@ -739,9 +863,8 @@ def main():
     
     args = parser.parse_args()
     
-    # 确保输出目录存在
-    KB_CHIPS_DIR.mkdir(parents=True, exist_ok=True)
-    KB_PRACTICES_DIR.mkdir(parents=True, exist_ok=True)
+    # 注意：知识库文件直接存入 ChromaDB，不再保存到本地目录
+    # KB_CHIPS_DIR 和 KB_PRACTICES_DIR 仅保留兼容性，不再使用
     
     watcher = GitHubRepoWatcher(args.repo, args.branch, args.token)
     

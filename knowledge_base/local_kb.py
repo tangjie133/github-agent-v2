@@ -26,13 +26,11 @@ class LocalKBManager:
         self.kb_dir = Path(kb_dir or "./knowledge_base")
         self.kb_dir.mkdir(parents=True, exist_ok=True)
         
-        # Subdirectories
+        # Subdirectories (保留兼容性，但不再自动创建)
+        # 注意：新版架构中知识库文件直接存入 ChromaDB，不再保存到本地目录
         self.chips_dir = self.kb_dir / "chips"
         self.best_practices_dir = self.kb_dir / "best_practices"
         self.history_dir = self.kb_dir / "history"
-        
-        for d in [self.chips_dir, self.best_practices_dir, self.history_dir]:
-            d.mkdir(exist_ok=True)
         
         # Metadata file
         self.metadata_file = self.kb_dir / "metadata.json"

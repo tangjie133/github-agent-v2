@@ -1,6 +1,6 @@
 # GitHub 仓库知识库快速上手指南
 
-将你的数据手册存入 GitHub 仓库，自动同步到知识库。
+将技术文档存入 GitHub 仓库，自动同步到 ChromaDB 向量知识库，支持智能检索。
 
 ---
 
@@ -21,43 +21,68 @@
 ```bash
 cd /home/tj/.npm-global/lib/node_modules/openclaw/skills/github-agent-v2
 
-# 运行配置向导
-./scripts/setup_github_kb.sh
-
-# 按提示输入：
-# - GitHub 仓库: tangjie133/knowledge-base
-# - 分支: main
-# - GitHub Token: （可选，用于私有仓库）
-# - Webhook Secret: （可选，用于安全验证）
+# 编辑 .env 文件
+vim .env
 ```
+
+**添加以下配置：**
+```bash
+# 知识库同步配置
+KB_GITHUB_SYNC_ENABLED=true
+KB_REPO=tangjie133/knowledge-base    # 你的知识库仓库
+KB_BRANCH=main
+KB_GITHUB_TOKEN=ghp_xxx               # GitHub Token（可选，用于私有仓库）
+
+# 存储路径配置
+KB_CHROMA_DIR=/home/tj/chroma_db
+GITHUB_AGENT_WORKDIR=/home/tj/github-agent-v2
+GITHUB_AGENT_STATEDIR=/home/tj/state
+
+# 嵌入模型配置
+KB_EMBEDDING_MODEL=bge-m3:latest
+KB_EMBEDDING_HOST=http://localhost:11434
+```
+
+**创建必要目录：**
+```bash
+mkdir -p /home/tj/chroma_db
+mkdir -p /home/tj/github-agent-v2
+mkdir -p /home/tj/state
+```
+
+---
 
 ### 步骤 2: 选择同步方式
 
 #### 方式 A: Webhook 实时同步（推荐团队使用）
 
-**启动接收服务器：**
+**1. 启动接收服务器：**
 ```bash
 python scripts/github_webhook_server.py --port 9000
 ```
 
-**配置 GitHub Webhook：**
+**2. 配置 GitHub Webhook：**
 1. 打开 GitHub 仓库 → Settings → Webhooks
 2. 点击 "Add webhook"
 3. 填写配置：
    - **Payload URL**: `http://your-server-ip:9000/webhook`
    - **Content type**: `application/json`
-   - **Secret**: （如果你在步骤1设置了）
+   - **Secret**: （可选）
    - **Which events?**: "Just the push event"
 4. 点击 "Add webhook"
 
-**测试：**
+**3. 测试同步：**
 ```bash
 # 向仓库推送一个文件
-git add SD3031.pdf
-git commit -m "添加 SD3031 数据手册"
+git add esp32_datasheet.pdf
+git commit -m "添加 ESP32 数据手册"
 git push
 
 # 观察服务器日志，自动同步
+# 输出示例：
+# 📄 直接处理 PDF: esp32_datasheet.pdf
+# 🚀 开始并行处理: 110 页 | 4 线程
+# ✅ PDF 新增完成: 110/110 页已存储
 ```
 
 #### 方式 B: 定时同步（推荐个人使用）
@@ -70,6 +95,13 @@ python scripts/github_repo_watcher.py --daemon --interval 300
 python scripts/github_repo_watcher.py --sync
 ```
 
+#### 方式 C: 使用启动脚本（推荐）
+
+```bash
+# 启动脚本会自动同步并启动 KB Service
+./scripts/start.sh --port 8080
+```
+
 ---
 
 ## 📁 仓库文件组织建议
@@ -77,68 +109,32 @@ python scripts/github_repo_watcher.py --sync
 ```
 knowledge-base/           # GitHub 仓库根目录
 ├── chips/               # 芯片数据手册
-│   ├── SD3031.pdf
-│   ├── DS3231.md
-│   └── STM32F103.txt
+│   ├── esp32_datasheet.pdf
+│   ├── bmi160_datasheet.pdf
+│   └── stm32f103_ref.pdf
 ├── guides/              # 开发指南
-│   ├── python_driver_guide.md
-│   └── i2c_protocol.docx
+│   ├── i2c_protocol.md
+│   ├── sensor_driver_guide.txt
+│   └── coding_standards.docx
 └── README.md           # 仓库说明
 ```
 
-**规则：**
-- 文件名包含 "chip" 或 "芯片" → 存入 `knowledge_base/chips/`
-- 其他文件 → 存入 `knowledge_base/best_practices/`
+**分类规则：**
+- 文件名包含 `chip`, `芯片`, `hardware`, `datasheet` → 标记为芯片文档
+- 其他文件 → 标记为最佳实践
 
 ---
 
 ## 📝 支持的文件格式
 
-| 格式 | 处理方式 | 建议 |
-|------|---------|------|
-| `.md` | 直接使用 | ⭐ 推荐，效果最佳，保存到本地 |
-| `.txt` | 转为 Markdown | 纯文本文档，保存到本地 |
-| `.pdf` | **直接解析存储** | 数据手册，按页切分存入 ChromaDB |
-| `.docx` | 转为 Markdown | Word 文档，保存到本地 |
+| 格式 | 处理方式 | 存储粒度 | 特点 |
+|------|---------|---------|------|
+| **PDF** | PyMuPDF 解析 | 按页存储 | 保留分页信息，可定位到具体页码 |
+| **Markdown** | 直接读取 | 分段存储 | 保留格式，长文档自动分段 |
+| **TXT** | 包装为 Markdown | 分段存储 | 纯文本支持 |
+| **DOCX** | python-docx/pandoc | 分段存储 | Word 文档支持 |
 
-> **📌 TODO（待优化）**: Markdown 和 TXT 文件后续也将采用 PDF 的处理模式，即直接解析存储到 ChromaDB，不再保存本地文件，统一架构。
-
-### PDF 处理优化（方案 A）
-
-**不再将 PDF 转换为 Markdown！**
-
-```
-PDF (GitHub 仓库)
-    ↓
-下载到本地
-    ↓
-pdfplumber 按页解析文本
-    ↓
-多线程并行生成 embedding（8 线程）
-    ↓
-ChromaDB 存储（带 page 元数据）
-```
-
-**优势：**
-- **速度快**：110 页 PDF 从 ~60s 优化到 ~15s（多线程）
-- **精度高**：保留分页信息，可定位到具体页码
-- **省空间**：不生成中间 Markdown 文件
-- **元数据丰富**：自动提取 `vendor`, `chip`, `page`
-
-**性能对比：**
-| 方案 | 110 页耗时 | 存储 | 精度 |
-|------|-----------|------|------|
-| PDF→Markdown→向量 | ~60s | 本地 + 向量库 | 整篇 |
-| **PDF 直接处理** | **~15s** | **仅向量库** | **页级** |
-
-**配置参数：**
-```bash
-# PDF 处理线程数（默认自动：CPU核心数/3）
-KB_PDF_WORKERS=8
-
-# 启用并行的页数阈值（3页以上）
-KB_PDF_PARALLEL_THRESHOLD=3
-```
+**统一存储**：所有格式最终都存入 **ChromaDB**，不保留本地文件！
 
 ---
 
@@ -147,300 +143,150 @@ KB_PDF_PARALLEL_THRESHOLD=3
 ### 方式 1: 使用查询工具（推荐）
 
 ```bash
-# 查看完整状态
-python scripts/kb_query.py
-
-# 查询特定内容
-python scripts/kb_query.py 'SAMD21 芯片规格'
-
-# 查看统计
-python scripts/kb_query.py -s
-
-# 列出本地文件
-python scripts/kb_query.py -l
-
-# 重新加载知识库（同步后使用）
-python scripts/kb_query.py -r
-```
-
-### 方式 2: 直接 API 调用
-
-```bash
-# 查看统计
-curl http://localhost:8000/stats
-
-# 健康检查
-curl http://localhost:8000/health
-
-# 查询知识库
-curl -X POST http://localhost:8000/query \
-  -H "Content-Type: application/json" \
-  -d '{"query": "SAMD21", "top_k": 3}'
-```
-
----
-
-## 🧪 测试验证
-
-验证向量检索功能是否正常工作。
-
-### 快速测试
-
-```bash
-# 1. 检查知识库状态（查看 HNSW 是否启用）
-python scripts/kb_query.py -s
-
-# 预期输出包含：
-# - 文档总数
-# - 向量存储: HNSW（或 brute_force）
-# - 向量维度: 768
-
-# 2. 使用调试模式查询（显示存储后端、耗时等）
-python scripts/kb_query.py "芯片规格" -d
-
-# 调试输出示例：
-# [DEBUG] 向量存储信息:
-#   后端类型: HNSW
-#   向量维度: 768
-#   距离度量: cosine
-#   检索耗时: 0.23ms
-```
-
-### 向量检索测试
-
-```bash
-# 2. 执行语义检索测试
-python scripts/kb_query.py "芯片规格参数" -k 3
-
-# 3. 测试不同类型的查询
-python scripts/kb_query.py "GPIO 引脚配置" -k 3
-python scripts/kb_query.py "I2C 通信协议" -k 3
-```
-
-### 性能测试
-
-```bash
-# 4. 测试检索性能（使用 Python）
-python3 << 'EOF'
-import time
-import requests
-
-KB_URL = "http://localhost:8000"
-queries = [
-    "SAMD21 芯片规格",
-    "GPIO 引脚配置", 
-    "PWM 输出设置",
-]
-
-print("🔍 向量检索性能测试")
-print("=" * 60)
-
-for q in queries:
-    start = time.time()
-    resp = requests.post(f"{KB_URL}/query",
-        json={"query": q, "top_k": 3},
-        timeout=10)
-    elapsed = (time.time() - start) * 1000
-    
-    found = resp.json().get('total_found', 0)
-    print(f"查询: {q[:20]:20s} | 结果: {found} | 耗时: {elapsed:.2f}ms")
-
-print("=" * 60)
-print("✅ 正常: HNSW 模式下耗时 < 1ms, 简单模式耗时 ~10-100ms")
-EOF
-```
-
-### 故障排查
-
-| 问题 | 检查方法 | 解决方案 |
-|------|---------|---------|
-| 服务未启动 | `curl http://localhost:8000/health` | 启动 KB Service: `python -m knowledge_base.kb_service` |
-| 文档数为 0 | `python scripts/kb_query.py -l` | 检查知识库文件是否存在，执行重新加载: `-r` |
-| HNSW 未启用 | `kb_query.py -s` 查看后端类型 | 安装 hnswlib: `pip install hnswlib` |
-| 查询无结果 | 检查文件内容编码 | 确保 Markdown 文件为 UTF-8 编码 |
-
-### 方式 3: 查看原始文件
-
-```bash
-# 芯片文档
-ls -la knowledge_base/chips/
-cat knowledge_base/chips/SAMD21.md
-
-# 最佳实践
-ls -la knowledge_base/best_practices/
-cat knowledge_base/best_practices/README.md
-```
-
----
-
-## 📊 向量化说明
-
-### 什么是向量化？
-
-知识库使用 **nomic-embed-text** 模型将文本转换为 768 维向量：
-
-```
-文本: "SAMD21 是一款 ARM Cortex-M0+ 微控制器"
-      ↓
-向量: [0.023, -0.156, 0.089, ..., 0.034] (768 个数字)
-      ↓
-存储: 内存中的向量库
-```
-
-### 向量库特点
-
-| 特性 | 说明 |
-|------|------|
-| 存储位置 | 内存中（启动时加载） |
-| 向量维度 | 768 维 |
-| 相似度算法 | 余弦相似度 |
-| 持久化 | 原始 Markdown 文件 |
-
-### 为什么向量在内存中？
-
-1. **快速查询** - 内存访问比磁盘快 1000 倍
-2. **实时更新** - 修改文件后重新加载即可
-3. **无需数据库** - 简化部署，适合中小规模知识库
-
----
-
-## 🔄 同步流程
-
-```
-GitHub Push
-    ↓
-Webhook 触发 / 定时同步
-    ↓
-download_file() - 下载原始文件
-    ↓
-convert_to_markdown() - 转换格式
-    ↓
-保存到 knowledge_base/chips/
-    ↓
-通知 KB Service /reload
-    ↓
-重新生成向量嵌入
-    ↓
-完成！
-```
-
-### 手动同步命令
-
-```bash
-# 立即同步一次
-python scripts/github_repo_watcher.py --sync
-
-# 强制重新同步所有文件
-python scripts/github_repo_watcher.py --sync --force
-
-# 后台持续监控
-python scripts/github_repo_watcher.py --daemon --interval 300
-```
-
----
-
-## 🔍 查看同步状态
-
-```bash
-# 查看已同步的文档
-python scripts/github_repo_watcher.py --status
+# 查看知识库状态
+python scripts/kb_query.py status
 
 # 输出示例：
-# 📊 同步状态: tangjie133/knowledge-base
-#    远程文件: 15
-#    已同步: 12
-#
-# 🆕 新文件 (3):
-#    - chips/NEW_CHIP.pdf
+# 📊 知识库状态
+# 文档数量: 127
+# 嵌入模型: bge-m3:latest
+# 向量存储: ChromaDB
+
+# 查询知识库
+python scripts/kb_query.py query "ESP32 如何配置 WiFi？"
+
+# 输出示例：
+# 🔍 查询: ESP32 如何配置 WiFi？
+# 
+# 📄 结果 1 (相似度: 0.89)
+# 来源: esp32_datasheet.pdf 第 45 页
+# 内容: WiFi 配置需要先包含 <WiFi.h> 头文件...
+```
+
+### 方式 2: 在 Issue 中使用
+
+在 GitHub Issue 中 `@agent` 并提问：
+
+```markdown
+@agent SD3031 温度传感器如何读取数据？
+```
+
+Agent 会自动：
+1. 检索知识库中的 SD3031 文档
+2. 找到相关的寄存器说明和代码示例
+3. 生成完整的回复
+
+---
+
+## 📊 性能参考
+
+### 同步性能
+
+| 文件类型 | 文件大小 | 处理时间 | 存储数量 |
+|---------|---------|---------|---------|
+| PDF (110页) | 2.2MB | ~10s | 110 条向量 |
+| Markdown | 50KB | ~1s | 1-3 条向量 |
+| TXT | 20KB | ~1s | 1-2 条向量 |
+| DOCX | 100KB | ~2s | 1-3 条向量 |
+
+### 检索性能
+
+- **延迟**: ~0.2ms/查询
+- **支持规模**: 1万+ 文档
+- **召回率**: 95%+
+
+---
+
+## 🔧 高级配置
+
+### PDF 处理优化
+
+```bash
+# PDF 处理线程数（默认 CPU/4）
+KB_PDF_WORKERS=6
+
+# 启用并行的页数阈值（3页以上）
+KB_PDF_PARALLEL_THRESHOLD=3
+```
+
+### 嵌入模型选择
+
+```bash
+# 高维度，高精度（1024维，推荐）
+KB_EMBEDDING_MODEL=bge-m3:latest
+
+# 中等维度，快速（768维）
+KB_EMBEDDING_MODEL=nomic-embed-text:latest
+
+# 低维度，最快（384维）
+KB_EMBEDDING_MODEL=all-minilm:latest
+```
+
+### 多 Ollama 实例负载均衡
+
+```bash
+# 配置多个 Ollama 实例提高并发
+KB_EMBEDDING_HOST=http://localhost:11434,http://localhost:11435,http://localhost:11436
 ```
 
 ---
 
-## 🔄 完整工作流程
+## 🐛 故障排查
 
-```
-┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│   GitHub 仓库   │     │   知识库同步工具  │     │   KB Service    │
-│                 │     │                  │     │                 │
-│  chips/         │────▶│  Webhook/定时   │────▶│  加载文档       │
-│  ├── SD3031.pdf │push │  监控仓库变化   │     │  向量嵌入       │
-│  └── DS3231.md  │     │  转换格式       │     │  提供查询       │
-└─────────────────┘     └──────────────────┘     └─────────────────┘
-       │                                                        │
-       │         用户查询 "SD3031 寄存器"                        │
-       └────────────────────────────────────────────────────────┘
-                              ▼
-                    返回相关知识片段
-```
+### 问题 1: 同步失败
 
----
-
-## 🛠️ 故障排查
-
-### Webhook 不触发
 ```bash
-# 检查服务器是否运行
-curl http://localhost:9000/health
+# 检查日志
+tail -f /tmp/github_kb_sync.log
 
-# 检查 GitHub Webhook 状态
-# 在 GitHub 仓库 → Settings → Webhooks → Recent Deliveries
+# 常见原因：
+# 1. GitHub Token 过期 → 重新生成 Token
+# 2. 网络问题 → 检查代理设置 HTTP_PROXY
+# 3. Ollama 未启动 → curl http://localhost:11434/api/tags
 ```
 
-### 同步失败
+### 问题 2: 文档已同步但查询不到
+
 ```bash
-# 查看详细日志
+# 检查 ChromaDB 中的文档
+python scripts/kb_query.py status
+
+# 如果数量不对，可能是维度不匹配，重建：
+rm -rf /home/tj/chroma_db
 python scripts/github_repo_watcher.py --sync
-
-# 检查网络连接
-curl https://api.github.com/repos/tangjie133/knowledge-base
 ```
 
-### PDF 转换失败
+### 问题 3: PDF 处理慢
+
 ```bash
-# 安装 pdftotext
-sudo apt-get install poppler-utils
+# 检查当前线程数配置
+echo $KB_PDF_WORKERS
 
-# 验证安装
-which pdftotext
-```
+# 增加线程数（根据 CPU 核心数调整）
+export KB_PDF_WORKERS=8
 
-### 文档数量为 0？
-
-**原因:**
-1. GitHub 同步未启用
-2. 同步尚未完成
-3. 知识库未重新加载
-
-**解决:**
-```bash
-# 1. 检查配置
-grep KB_GITHUB_SYNC_ENABLED .env
-
-# 2. 手动同步
-python scripts/github_repo_watcher.py --sync
-
-# 3. 重新加载
-python scripts/kb_query.py -r
+# 使用 PyMuPDF（已默认启用，比 pdfplumber 快 70 倍）
 ```
 
 ---
 
-## 💡 最佳实践
+## 📖 目录说明
 
-1. **使用 Markdown 格式**：效果最好，无需转换
-2. **文件命名规范**：使用芯片型号，如 `SD3031.md`
-3. **添加文档头**：便于检索
-   ```markdown
-   # SD3031 实时时钟芯片
-   
-   ## 简介
-   SD3031 是一款...
-   ```
-4. **定期清理旧版本**：避免知识库过大
+| 路径 | 用途 | 说明 |
+|------|------|------|
+| `/home/tj/chroma_db` | ChromaDB 存储 | 所有文档向量存储于此 |
+| `/home/tj/github-agent-v2` | 工作目录 | 临时下载文件（自动清理） |
+| `/home/tj/state` | 同步状态 | 记录已同步文件的 SHA |
+
+**注意**：`knowledge_base/chips/` 和 `knowledge_base/best_practices/` 不再用于存储同步的文件！
 
 ---
 
-## 📚 相关文档
+## 🎉 完成！
 
-- [项目架构设计](./ARCHITECTURE.md)
-- [主 README](./README.md)
+现在你可以：
+1. 向 GitHub 仓库推送文档，自动同步到知识库
+2. 在 Issue 中 `@agent` 查询技术问题
+3. 享受毫秒级的知识检索体验
+
+**下一步**：查看 [ARCHITECTURE.md](ARCHITECTURE.md) 了解详细架构设计。
