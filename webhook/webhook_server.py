@@ -26,7 +26,10 @@ app = Flask(__name__)
 
 # Configuration
 WEBHOOK_SECRET = os.environ.get("GITHUB_WEBHOOK_SECRET", "")
-WEBHOOK_DIR = os.environ.get("GITHUB_AGENT_WEBHOOK_DIR", "/tmp/github-webhooks-v2")
+
+# Webhook 事件保存目录（默认使用 GITHUB_AGENT_STATEDIR）
+STATEDIR = Path(os.environ.get("GITHUB_AGENT_STATEDIR", "/tmp/github-agent-state"))
+WEBHOOK_DIR = os.environ.get("GITHUB_AGENT_WEBHOOK_DIR", str(STATEDIR / "webhooks"))
 
 
 class WebhookServer:

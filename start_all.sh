@@ -53,6 +53,12 @@ echo ""
 export LOG_LEVEL=DEBUG
 export PYTHONUNBUFFERED=1
 
+# 统一路径配置 - webhook 目录基于 GITHUB_AGENT_STATEDIR
+export GITHUB_AGENT_STATEDIR="${GITHUB_AGENT_STATEDIR:-/home/tj/state}"
+export GITHUB_AGENT_WEBHOOK_DIR="${GITHUB_AGENT_STATEDIR}/webhooks"
+echo "使用 STATEDIR: $GITHUB_AGENT_STATEDIR"
+echo "Webhook 目录: $GITHUB_AGENT_WEBHOOK_DIR"
+
 # 启动主服务
 trap 'echo ""; echo "停止 KB Service..."; kill $KB_PID 2>/dev/null; exit 0' INT
 python3 main.py --port 8080
