@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
-知识库服务 (KB Service)
+知识库服务 (KB Service) - 重构版
 
-处理流程：PDF → 结构化文本 → chunk → embedding → ChromaDB
+统一接口：所有文档类型（Markdown/PDF）使用相同的处理流程
+存储结构：${GITHUB_AGENT_STATEDIR}/
+  - knowledge_base/chips/       # 芯片文档
+  - knowledge_base/best_practices/  # 最佳实践
+  - chroma_db/                  # ChromaDB 向量数据库
 """
 
 import os
 import sys
 import json
-import logging
 import hashlib
+import logging
 import requests
 import requests.adapters
 import urllib3
@@ -19,13 +23,23 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 import time
 
+# 配置日志
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
 logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+# 添加项目路径
+sys.path.insert(0, str(Path(__file__).parent))
+
+try:
+    from .schema import DocumentChunk, ChunkMetadata, QueryResult, DocType
+    from .document_processor import DocumentProcessor, process_document
+except ImportError:
+    from schema import DocumentChunk, ChunkMetadata, QueryResult, DocType
+    from document_processor import DocumentProcessor, process_document
 
 
 class SimpleEmbedding:
@@ -37,7 +51,6 @@ class SimpleEmbedding:
         "bge-m3": 1024,
         "bge-m3:latest": 1024,
         "all-minilm": 384,
-        "all-minilm:latest": 384,
     }
     
     def __init__(self, model: str = "nomic-embed-text", host: str = "http://localhost:11434"):
@@ -115,53 +128,78 @@ class ChromaVectorStore:
         )
         logger.info(f"ChromaDB 已初始化: {persist_dir}")
     
-    def add_with_embedding(self, text: str, embedding: List[float], metadata: Dict[str, Any]) -> str:
-        doc_id = hashlib.md5(f"{metadata.get('source', 'unknown')}_{text[:100]}".encode()).hexdigest()
+    def add_chunk(self, chunk: DocumentChunk, embedding: List[float]) -> str:
+        """添加单个 chunk"""
         self.collection.add(
-            ids=[doc_id],
+            ids=[chunk.embedding_id],
             embeddings=[embedding],
-            documents=[text],
-            metadatas=[metadata]
+            documents=[chunk.content],
+            metadatas=[chunk.metadata.to_dict()]
         )
-        return doc_id
+        return chunk.embedding_id
     
-    def search(self, query_embedding: List[float], top_k: int = 5) -> List[Dict[str, Any]]:
+    def search(
+        self, 
+        query_embedding: List[float], 
+        top_k: int = 5,
+        filters: Dict[str, Any] = None
+    ) -> List[QueryResult]:
+        """
+        搜索相似 chunks
+        
+        Args:
+            query_embedding: 查询向量
+            top_k: 返回结果数
+            filters: 元数据过滤条件，如 {"vendor": "bosch"}
+        """
         try:
+            # 构建 where 条件
+            where_clause = filters if filters else None
+            
             results = self.collection.query(
                 query_embeddings=[query_embedding],
                 n_results=min(top_k, max(1, self.collection.count())),
+                where=where_clause,
                 include=["documents", "metadatas", "distances"]
             )
             
             output = []
             for i in range(len(results['ids'][0])):
                 distance = results['distances'][0][i]
-                similarity = 1 - distance
-                output.append({
-                    "id": results['ids'][0][i],
-                    "text": results['documents'][0][i],
-                    "metadata": results['metadatas'][0][i],
-                    "similarity": round(similarity, 4)
-                })
+                similarity = 1 - distance  # cosine distance to similarity
+                
+                metadata = ChunkMetadata.from_dict(results['metadatas'][0][i])
+                
+                output.append(QueryResult(
+                    content=results['documents'][0][i],
+                    metadata=metadata,
+                    similarity=round(similarity, 4)
+                ))
             return output
         except Exception as e:
             logger.error(f"搜索失败: {e}")
             return []
     
     def delete_by_source(self, source: str):
+        """删除指定来源的所有 chunks"""
         try:
-            results = self.collection.get(where={"source": source}, include=[])
+            results = self.collection.get(
+                where={"source": source},
+                include=[]
+            )
             if results['ids']:
                 self.collection.delete(ids=results['ids'])
+                logger.info(f"已删除 {len(results['ids'])} 个 chunks: {source}")
         except Exception as e:
             logger.error(f"删除失败: {e}")
     
-    def get_document_hashes(self) -> Dict[str, str]:
-        """获取已存储文件的哈希（用于增量检测）"""
+    def get_stored_hashes(self) -> Dict[str, str]:
+        """获取已存储文件的 hash（用于增量检测）"""
         try:
             results = self.collection.get(include=["metadatas"])
             hashes = {}
             seen = set()
+            
             for meta in results['metadatas']:
                 source = meta.get('source', '')
                 file_hash = meta.get('file_hash', '')
@@ -170,7 +208,7 @@ class ChromaVectorStore:
                     seen.add(source)
             return hashes
         except Exception as e:
-            logger.error(f"获取哈希失败: {e}")
+            logger.error(f"获取 hash 失败: {e}")
             return {}
     
     def count(self) -> int:
@@ -178,140 +216,52 @@ class ChromaVectorStore:
             return self.collection.count()
         except:
             return 0
-    
-    def get_stats(self) -> Dict[str, Any]:
-        return {
-            "total_documents": self.count(),
-            "persist_dir": self.persist_dir
-        }
 
 
 class KnowledgeBaseService:
     """知识库服务"""
     
-    def __init__(self, data_dir: str = None, embedding_model: str = None, 
-                 embedding_host: str = None, chroma_dir: str = None):
+    def __init__(self, 
+                 embedding_model: str = None, 
+                 embedding_host: str = None,
+                 chroma_dir: str = None):
         
-        # 从环境变量获取状态目录
+        # 状态目录
         statedir = Path(os.environ.get("GITHUB_AGENT_STATEDIR", "/tmp/github-agent-state"))
         statedir.mkdir(parents=True, exist_ok=True)
         
-        # 知识库目录（基于 STATEDIR）
-        self.kb_chips_dir = statedir / "knowledge_base" / "chips"
-        self.kb_practices_dir = statedir / "knowledge_base" / "best_practices"
+        # 知识库目录
+        self.kb_dirs = {
+            "chips": statedir / "knowledge_base" / "chips",
+            "practices": statedir / "knowledge_base" / "best_practices"
+        }
+        for d in self.kb_dirs.values():
+            d.mkdir(parents=True, exist_ok=True)
         
-        # 初始化嵌入模型
+        # 初始化组件
         self.embedding_model = embedding_model or "nomic-embed-text"
         self.embedding_host = embedding_host or "http://localhost:11434"
         self.embedder = SimpleEmbedding(model=self.embedding_model, host=self.embedding_host)
         
-        # 初始化 ChromaDB（也在 STATEDIR 下）
+        # ChromaDB
         chroma_path = chroma_dir or str(statedir / "chroma_db")
         self.vector_store = ChromaVectorStore(persist_dir=chroma_path)
         
-        # 初始化 PDF 处理器
-        self._init_pdf_processor()
+        # 文档处理器
+        self.doc_processor = DocumentProcessor()
         
-        # 确保知识库目录存在
-        self.kb_chips_dir.mkdir(parents=True, exist_ok=True)
-        self.kb_practices_dir.mkdir(parents=True, exist_ok=True)
-        
-        # 后台加载知识库（避免启动阻塞）
+        # 后台加载
         threading.Thread(target=self._sync_knowledge, daemon=True).start()
-    
-    def _init_pdf_processor(self):
-        try:
-            sys.path.insert(0, str(Path(__file__).parent))
-            from pdf_processor import PDFProcessor
-            self.pdf_processor = PDFProcessor(
-                embedder=self.embedder,
-                chunk_size=500,
-                overlap=80
-            )
-        except Exception as e:
-            logger.warning(f"PDF 处理器初始化失败: {e}")
-            self.pdf_processor = None
-    
-    def _get_kb_dirs(self) -> List[tuple]:
-        """获取知识库目录"""
-        return [(self.kb_chips_dir, "chip"), (self.kb_practices_dir, "practice")]
-    
-    def _calc_hash(self, file: Path) -> str:
-        """计算文件哈希"""
-        if file.suffix.lower() == '.pdf':
-            stat = file.stat()
-            return hashlib.md5(f"{stat.st_size}_{stat.st_mtime}".encode()).hexdigest()
-        else:
-            return hashlib.md5(file.read_bytes()).hexdigest()
-    
-    def _process_file(self, file: Path, doc_type: str, stored_hashes: Dict[str, str]) -> tuple:
-        """处理单个文件，返回 (status, hash)"""
-        file_key = str(file)
-        file_hash = self._calc_hash(file)
-        
-        # 检查是否已存在
-        if file_key in stored_hashes and stored_hashes[file_key] == file_hash:
-            return "unchanged", file_hash
-        
-        # 删除旧数据（如果存在）
-        if file_key in stored_hashes:
-            self.vector_store.delete_by_source(file_key)
-        
-        # 处理 Markdown
-        if file.suffix.lower() == '.md':
-            content = file.read_text(encoding='utf-8')
-            embedding = self.embedder.embed(content[:1000])
-            self.vector_store.add_with_embedding(
-                content, embedding,
-                {"source": file_key, "type": doc_type, "file_hash": file_hash}
-            )
-            logger.info(f"已加载 Markdown: {file.name}")
-            return "added", file_hash
-        
-        # 处理 PDF
-        if file.suffix.lower() == '.pdf' and self.pdf_processor:
-            from pdf_processor import PDFMetadata
-            metadata = self.pdf_processor.extract_metadata_from_filename(file.name)
-            metadata.source = file_key
-            
-            result = self.pdf_processor.process_and_store(
-                pdf_path=file,
-                vector_store=self.vector_store,
-                metadata=metadata
-            )
-            
-            # 更新第一个 chunk 的 hash
-            if result.get("chunks_stored", 0) > 0:
-                try:
-                    res = self.vector_store.collection.get(
-                        where={"source": file_key}, limit=1, include=["metadatas"]
-                    )
-                    if res['ids']:
-                        old_id = res['ids'][0]
-                        old = self.vector_store.collection.get(
-                            ids=[old_id], include=["documents", "embeddings"]
-                        )
-                        if old['documents']:
-                            self.vector_store.collection.delete(ids=[old_id])
-                            meta = res['metadatas'][0].copy()
-                            meta['file_hash'] = file_hash
-                            self.vector_store.add_with_embedding(
-                                old['documents'][0], old['embeddings'][0], meta
-                            )
-                except:
-                    pass
-            
-            logger.info(f"已加载 PDF: {file.name}")
-            return "added", file_hash
-        
-        return "failed", ""
     
     def _sync_knowledge(self):
         """同步知识库（增量加载）"""
-        stored_hashes = self.vector_store.get_document_hashes()
+        time.sleep(1)  # 等待服务启动
+        
+        stored_hashes = self.vector_store.get_stored_hashes()
         stats = {"added": 0, "unchanged": 0, "failed": 0}
         
-        for dir_path, doc_type in self._get_kb_dirs():
+        for dir_path, doc_type in [(self.kb_dirs["chips"], DocType.CHIP), 
+                                   (self.kb_dirs["practices"], DocType.PRACTICE)]:
             if not dir_path.exists():
                 continue
             
@@ -320,37 +270,78 @@ class KnowledgeBaseService:
                     continue
                 
                 try:
-                    status, _ = self._process_file(file, doc_type, stored_hashes)
+                    status = self._process_file(file, doc_type, stored_hashes)
                     stats[status] += 1
                 except Exception as e:
                     stats["failed"] += 1
                     logger.warning(f"处理失败 {file}: {e}")
         
-        if stats["added"] + stats["unchanged"] > 0:
+        total = stats["added"] + stats["unchanged"]
+        if total > 0:
             logger.info(f"加载完成: 新增 {stats['added']}, 未变更 {stats['unchanged']}, 失败 {stats['failed']}")
+    
+    def _process_file(self, file: Path, doc_type: DocType, stored_hashes: Dict[str, str]) -> str:
+        """
+        处理单个文件
+        
+        Returns:
+            "added" / "unchanged" / "failed"
+        """
+        file_key = str(file)
+        
+        # 计算文件 hash
+        if file.suffix.lower() == '.pdf':
+            stat = file.stat()
+            file_hash = hashlib.md5(f"{stat.st_size}_{stat.st_mtime}".encode()).hexdigest()
         else:
-            logger.info("知识库为空")
+            file_hash = hashlib.md5(file.read_bytes()).hexdigest()
+        
+        # 检查是否已存在
+        if file_key in stored_hashes and stored_hashes[file_key] == file_hash:
+            return "unchanged"
+        
+        # 删除旧数据
+        if file_key in stored_hashes:
+            self.vector_store.delete_by_source(file_key)
+        
+        # 解析文档
+        doc = self.doc_processor.process(file, doc_type)
+        
+        # 生成 embeddings 并存储
+        for chunk in doc.chunks:
+            embedding = self.embedder.embed(chunk.content[:2000])
+            chunk.metadata.file_hash = file_hash
+            self.vector_store.add_chunk(chunk, embedding)
+        
+        logger.info(f"已加载: {file.name} ({len(doc.chunks)} chunks)")
+        return "added"
     
-    def reload(self) -> Dict[str, Any]:
-        """重新加载（API 调用）"""
-        logger.info("重新加载知识库...")
-        self._sync_knowledge()
-        return {"status": "success", "documents": self.vector_store.count()}
-    
-    def query(self, query_text: str, top_k: int = 3) -> Dict[str, Any]:
+    def query(self, query_text: str, top_k: int = 3, filters: Dict[str, Any] = None) -> Dict[str, Any]:
         """查询知识库"""
-        import time
         start = time.time()
         
         query_embedding = self.embedder.embed(query_text)
-        results = self.vector_store.search(query_embedding, top_k)
+        results = self.vector_store.search(query_embedding, top_k, filters)
         
         return {
             "query": query_text,
-            "results": results,
+            "results": [
+                {
+                    "content": r.content,
+                    "metadata": r.metadata.to_dict(),
+                    "similarity": r.similarity
+                }
+                for r in results
+            ],
             "total_found": len(results),
             "elapsed_ms": round((time.time() - start) * 1000, 2)
         }
+    
+    def reload(self) -> Dict[str, Any]:
+        """重新加载知识库"""
+        logger.info("重新加载知识库...")
+        self._sync_knowledge()
+        return {"status": "success", "documents": self.vector_store.count()}
     
     def health_check(self) -> bool:
         try:
@@ -403,21 +394,18 @@ class KBRequestHandler(BaseHTTPRequestHandler):
         if self.path == "/query":
             query = data.get("query", "")
             top_k = data.get("top_k", 3)
+            filters = data.get("filters")  # 支持 metadata 过滤
+            
             if not query:
                 self._send_json({"error": "Missing query"}, 400)
                 return
-            self._send_json(self.kb_service.query(query, top_k))
-        elif self.path == "/add":
-            text = data.get("text", "")
-            metadata = data.get("metadata", {})
-            if not text:
-                self._send_json({"error": "Missing text"}, 400)
-                return
-            embedding = self.kb_service.embedder.embed(text[:2000])
-            self.kb_service.vector_store.add_with_embedding(text, embedding, metadata)
-            self._send_json({"status": "success"})
+            
+            result = self.kb_service.query(query, top_k, filters)
+            self._send_json(result)
+        
         elif self.path == "/reload":
             self._send_json(self.kb_service.reload())
+        
         else:
             self._send_json({"error": "Not found"}, 404)
     
@@ -428,15 +416,13 @@ class KBRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
 
-def run_server(host: str = "0.0.0.0", port: int = 8000, data_dir: str = None,
-               embedding_model: str = None, embedding_host: str = None, chroma_dir: str = None):
+def run_server(host: str = "0.0.0.0", port: int = 8000,
+               embedding_model: str = None, embedding_host: str = None):
     logger.info(f"启动知识库服务 {host}:{port}")
     
     kb_service = KnowledgeBaseService(
-        data_dir=data_dir,
         embedding_model=embedding_model,
-        embedding_host=embedding_host,
-        chroma_dir=chroma_dir
+        embedding_host=embedding_host
     )
     
     KBRequestHandler.kb_service = kb_service
@@ -456,7 +442,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--chroma-dir", default=None, help="ChromaDB 目录（默认使用 GITHUB_AGENT_STATEDIR/chroma_db）")
     parser.add_argument("--embedding-model", default="nomic-embed-text")
     parser.add_argument("--embedding-host", default="http://localhost:11434")
     args = parser.parse_args()
@@ -464,7 +449,6 @@ if __name__ == "__main__":
     run_server(
         host=args.host,
         port=args.port,
-        chroma_dir=args.chroma_dir,
         embedding_model=args.embedding_model,
         embedding_host=args.embedding_host
     )
