@@ -2,23 +2,8 @@
 """
 GitHub 仓库知识库同步工具
 
-监听指定 GitHub 仓库，自动拉取新文件并转换为知识库格式
-
-支持的文件格式：
-- .md - Markdown 文件（直接使用）
-- .txt - 文本文件（转换为 Markdown）
-- .pdf - PDF 文档（提取文本后转换）
-- .docx - Word 文档（转换为 Markdown）
-
-用法：
-    # 手动同步一次
-    python github_repo_watcher.py --sync
-    
-    # 后台监控模式（定期检查更新）
-    python github_repo_watcher.py --daemon --interval 300
-    
-    # 配置 Webhook 自动触发
-    python github_repo_watcher.py --webhook --port 9000
+同步文件到 GITHUB_AGENT_STATEDIR/knowledge_base/ 目录
+通知 KB Service 重新加载
 """
 
 import os
@@ -27,881 +12,265 @@ import json
 import time
 import argparse
 import hashlib
-import subprocess
+import requests
 from pathlib import Path
 from datetime import datetime
-from typing import List, Set, Dict
+from typing import List, Dict
 import logging
 
-# 添加项目路径
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-# 加载 .env 文件
+# 首先加载 .env 文件（在设置任何路径之前）
 try:
     from dotenv import load_dotenv
     env_path = Path(__file__).parent.parent / ".env"
     if env_path.exists():
-        load_dotenv(env_path)
+        load_dotenv(env_path, override=True)  # override=True 确保 .env 中的值覆盖环境变量
 except ImportError:
-    pass  # python-dotenv 未安装，依赖环境变量
+    pass
 
-# 抑制第三方库的 DEBUG 日志
+# 配置日志
+logging.basicConfig(
+    level=getattr(logging, os.environ.get('LOG_LEVEL', 'INFO').upper()),
+    format='%(asctime)s [%(name)s] %(levelname)s: %(message)s',
+    datefmt='%H:%M:%S'
+)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("requests").setLevel(logging.WARNING)
-
-# 日志配置（如果作为主程序运行）
-if __name__ == "__main__":
-    log_level = os.environ.get('LOG_LEVEL', 'INFO').upper()
-    logging.basicConfig(
-        level=getattr(logging, log_level),
-        format='%(asctime)s [%(name)s] %(levelname)s: %(message)s',
-        datefmt='%H:%M:%S'
-    )
-    # 再次确保第三方库日志级别
-    logging.getLogger("urllib3").setLevel(logging.WARNING)
-    logging.getLogger("requests").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # 默认配置
 DEFAULT_REPO = "tangjie133/knowledge-base"
 DEFAULT_BRANCH = "main"
-
-# 知识库目录配置（支持环境变量）
-KB_BASE_DIR = Path(os.environ.get("KB_BASE_DIR", Path(__file__).parent.parent / "knowledge_base"))
-KB_CHIPS_DIR = Path(os.environ.get("KB_CHIPS_DIR", KB_BASE_DIR / "chips"))
-KB_PRACTICES_DIR = Path(os.environ.get("KB_PRACTICES_DIR", KB_BASE_DIR / "best_practices"))
-
-# 支持的文件格式
-SUPPORTED_EXTS = {'.md', '.txt', '.pdf', '.docx'}
-
-# 同步状态文件路径（支持环境变量配置）
-_state_dir = os.environ.get("GITHUB_AGENT_STATEDIR")
-if _state_dir:
-    SYNC_STATE_FILE = Path(_state_dir) / ".github_kb_sync_state.json"
-else:
-    SYNC_STATE_FILE = Path(__file__).parent.parent / ".github_kb_sync_state.json"
+KB_SERVICE_URL = os.environ.get("KB_SERVICE_URL", "http://localhost:8000")
 
 
-class ContentClassifier:
-    """
-    智能内容分类器
+def get_statedir() -> Path:
+    """获取状态目录（从环境变量，默认 /tmp/github-agent-state）"""
+    statedir = Path(os.environ.get("GITHUB_AGENT_STATEDIR", "/tmp/github-agent-state"))
+    return statedir
+
+
+def get_kb_dirs():
+    """获取知识库目录路径"""
+    statedir = get_statedir()
+    kb_base = statedir / "knowledge_base"
+    return {
+        "base": kb_base,
+        "chips": kb_base / "chips",
+        "practices": kb_base / "best_practices",
+        "sync_state": statedir / ".github_kb_sync_state.json"
+    }
+
+
+class GitHubKBWatcher:
+    """GitHub 知识库同步器"""
     
-    支持多种分类策略：
-    1. 配置文件规则（用户自定义）
-    2. 文件内容启发式分析
-    3. AI 辅助分类（使用 Ollama）
-    """
-    
-    def __init__(self, config_file: str = None):
-        self.config_file = config_file or os.environ.get("KB_CLASSIFIER_CONFIG")
-        self.rules = self._load_rules()
-        self.ollama_host = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-        self.ollama_model = os.environ.get("KB_CLASSIFIER_MODEL", "qwen2.5:7b")
-        
-    def _load_rules(self) -> Dict:
-        """加载分类规则"""
-        default_rules = {
-            "categories": {
-                "chips": {
-                    "keywords": ["芯片", "datasheet", "数据手册", "specification", "规格书"],
-                    "file_patterns": ["*chip*", "*datasheet*", "*硬件*", "*hardware*"],
-                    "content_indicators": ["型号", "参数", "引脚", "电气特性"]
-                },
-                "best_practices": {
-                    "keywords": ["指南", "教程", "最佳实践", "guide", "tutorial"],
-                    "file_patterns": ["*guide*", "*tutorial*", "*practice*"],
-                    "content_indicators": ["步骤", "方法", "建议", "示例"]
-                }
-            },
-            "default_category": "best_practices",
-            "use_ai": False  # 默认不使用AI，避免额外延迟
-        }
-        
-        if self.config_file and Path(self.config_file).exists():
-            try:
-                with open(self.config_file, 'r', encoding='utf-8') as f:
-                    user_rules = json.load(f)
-                    default_rules.update(user_rules)
-                    logger.info(f"已加载分类规则: {self.config_file}")
-            except Exception as e:
-                logger.warning(f"加载分类规则失败: {e}，使用默认规则")
-        
-        return default_rules
-    
-    def classify(self, file_path: str, content: str = None) -> str:
-        """
-        分类文件，返回类别目录名
-        
-        Args:
-            file_path: 文件路径
-            content: 文件内容（可选，用于内容分析）
-            
-        Returns:
-            类别目录名（如 "chips", "best_practices"）
-        """
-        path_lower = file_path.lower()
-        filename = Path(file_path).name.lower()
-        
-        # 策略1: 文件名匹配
-        for category, rules in self.rules["categories"].items():
-            # 检查文件模式
-            for pattern in rules.get("file_patterns", []):
-                pattern_lower = pattern.lower().replace("*", "")
-                if pattern_lower in filename or pattern_lower in path_lower:
-                    return category
-            
-            # 检查关键词
-            for keyword in rules.get("keywords", []):
-                if keyword.lower() in filename or keyword.lower() in path_lower:
-                    return category
-        
-        # 策略2: 内容分析（如果有内容）
-        if content:
-            category = self._classify_by_content(content)
-            if category:
-                return category
-        
-        # 策略3: AI 分类（如果启用）
-        if self.rules.get("use_ai", False) and content:
-            category = self._classify_by_ai(file_path, content)
-            if category:
-                return category
-        
-        # 默认分类
-        return self.rules.get("default_category", "best_practices")
-    
-    def _classify_by_content(self, content: str) -> str:
-        """基于内容启发式分类"""
-        content_lower = content[:2000].lower()  # 只检查前2000字符
-        
-        scores = {}
-        for category, rules in self.rules["categories"].items():
-            score = 0
-            for indicator in rules.get("content_indicators", []):
-                if indicator.lower() in content_lower:
-                    score += 1
-            scores[category] = score
-        
-        # 返回得分最高的类别（至少要有1分）
-        if scores:
-            best_category = max(scores, key=scores.get)
-            if scores[best_category] > 0:
-                return best_category
-        
-        return None
-    
-    def _classify_by_ai(self, file_path: str, content: str) -> str:
-        """使用 Ollama AI 分类"""
-        try:
-            import requests
-            
-            # 准备提示词
-            prompt = f"""请分析以下文档内容，判断它属于哪一类：
-
-文件名: {file_path}
-内容摘要: {content[:1000]}...
-
-可选类别:
-{json.dumps(list(self.rules["categories"].keys()), ensure_ascii=False, indent=2)}
-
-请只返回类别名称，不要解释。"""
-
-            response = requests.post(
-                f"{self.ollama_host}/api/generate",
-                json={
-                    "model": self.ollama_model,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {"temperature": 0.1}
-                },
-                timeout=30
-            )
-            
-            if response.status_code == 200:
-                result = response.json().get("response", "").strip().lower()
-                # 验证返回的类别是否有效
-                for category in self.rules["categories"].keys():
-                    if category.lower() in result:
-                        return category
-                        
-        except Exception as e:
-            logger.debug(f"AI 分类失败: {e}")
-        
-        return None
-    
-    def get_category_dir(self, category: str) -> Path:
-        """获取类别的本地目录"""
-        return KB_BASE_DIR / category
-    
-    def list_categories(self) -> List[str]:
-        """列出所有可用类别"""
-        return list(self.rules["categories"].keys())
-
-
-class GitHubRepoWatcher:
-    """GitHub 仓库监听器"""
-    
-    def __init__(self, repo: str, branch: str = "main", token: str = None):
-        self.repo = repo
-        self.branch = branch
+    def __init__(self, repo: str = None, branch: str = None, token: str = None):
+        self.repo = repo or os.environ.get("KB_REPO", DEFAULT_REPO)
+        self.branch = branch or os.environ.get("KB_BRANCH", DEFAULT_BRANCH)
         self.token = token or os.environ.get("GITHUB_TOKEN", "")
-        self.api_base = "https://api.github.com"
-        self.raw_base = "https://raw.githubusercontent.com"
         
-    def _get_headers(self) -> Dict[str, str]:
-        """获取 API 请求头"""
-        headers = {
+        self.api_base = f"https://api.github.com/repos/{self.repo}"
+        self.headers = {
             "Accept": "application/vnd.github.v3+json",
-            "User-Agent": "GitHub-Agent-KB-Sync"
+            "User-Agent": "GitHub-KB-Watcher"
         }
         if self.token:
-            headers["Authorization"] = f"token {self.token}"
-        return headers
-    
-    def _get_proxies(self) -> Dict[str, str]:
-        """获取代理配置"""
-        proxies = {}
+            self.headers["Authorization"] = f"token {self.token}"
         
-        # 从环境变量读取代理配置
-        http_proxy = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
-        https_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
-        all_proxy = os.environ.get("ALL_PROXY") or os.environ.get("all_proxy")
+        # 获取路径配置
+        self.paths = get_kb_dirs()
         
-        if http_proxy:
-            proxies["http"] = http_proxy
-        if https_proxy:
-            proxies["https"] = https_proxy
-        if all_proxy and not proxies:
-            proxies["http"] = all_proxy
-            proxies["https"] = all_proxy
-            
-        return proxies
+        # 确保目录存在
+        self.paths["chips"].mkdir(parents=True, exist_ok=True)
+        self.paths["practices"].mkdir(parents=True, exist_ok=True)
+        
+        logger.info(f"📁 知识库目录: {self.paths['base']}")
+        logger.info(f"📁 同步状态: {self.paths['sync_state']}")
+        logger.info(f"📁 状态根目录: {get_statedir()}")
     
-    def get_repo_files(self) -> List[Dict]:
+    def _api_get(self, url: str, params: dict = None) -> dict:
+        """调用 GitHub API"""
+        response = requests.get(url, headers=self.headers, params=params, timeout=30)
+        if response.status_code == 403 and "rate limit" in response.text.lower():
+            raise RuntimeError("GitHub API 速率限制，请设置 GITHUB_TOKEN")
+        response.raise_for_status()
+        return response.json()
+    
+    def get_repo_files(self) -> List[dict]:
         """获取仓库文件列表"""
-        import requests
-        
-        url = f"{self.api_base}/repos/{self.repo}/git/trees/{self.branch}?recursive=1"
-        
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                response = requests.get(url, headers=self._get_headers(), proxies=self._get_proxies(), timeout=30)
-                
-                # 处理速率限制
-                if response.status_code == 403 and "rate limit" in response.text.lower():
-                    if not self.token:
-                        logger.error("❌ GitHub API 速率限制 exceeded")
-                        logger.error("   原因: 未提供 GITHUB_TOKEN")
-                        logger.error("   解决: 设置 GITHUB_TOKEN 环境变量")
-                        logger.error("   获取: https://github.com/settings/tokens")
-                        return []
-                    else:
-                        # 有 token 但仍然被限制，等待重试
-                        reset_time = int(response.headers.get("X-RateLimit-Reset", 0))
-                        if reset_time:
-                            wait_sec = max(reset_time - int(time.time()), 60)
-                            logger.warning(f"⚠️  API 速率限制，等待 {wait_sec} 秒后重试...")
-                            time.sleep(min(wait_sec, 60))  # 最多等待60秒
-                            continue
-                
-                response.raise_for_status()
-                data = response.json()
-                
-                files = []
-                for item in data.get("tree", []):
-                    if item.get("type") == "blob":
-                        ext = Path(item["path"]).suffix.lower()
-                        if ext in SUPPORTED_EXTS:
-                            files.append({
-                                "path": item["path"],
-                                "sha": item["sha"],
-                                "size": item.get("size", 0),
-                                "url": item["url"]
-                            })
-                
-                logger.info(f"📁 发现 {len(files)} 个支持的文件")
-                return files
-                
-            except requests.exceptions.RequestException as e:
-                if attempt < max_retries - 1:
-                    wait = 2 ** attempt  # 指数退避
-                    logger.warning(f"⚠️  请求失败，{wait}秒后重试... ({e})")
-                    time.sleep(wait)
-                else:
-                    logger.error(f"❌ 获取文件列表失败: {e}")
-                    return []
-            except Exception as e:
-                logger.error(f"❌ 获取文件列表失败: {e}")
-                return []
-        
-        return []
-    
-    def download_file(self, file_path: str, output_path: Path) -> bool:
-        """下载单个文件"""
-        import requests
-        
-        url = f"{self.raw_base}/{self.repo}/{self.branch}/{file_path}"
+        url = f"{self.api_base}/git/trees/{self.branch}"
+        params = {"recursive": "1"}
         
         try:
-            response = requests.get(url, headers=self._get_headers(), proxies=self._get_proxies(), timeout=60)
+            data = self._api_get(url, params)
+            files = []
+            for item in data.get("tree", []):
+                if item["type"] == "blob":
+                    ext = Path(item["path"]).suffix.lower()
+                    if ext in {'.md', '.pdf'}:
+                        files.append({
+                            "path": item["path"],
+                            "sha": item["sha"]
+                        })
+            logger.info(f"📋 发现 {len(files)} 个知识库文件")
+            return files
+        except Exception as e:
+            logger.error(f"❌ 获取文件列表失败: {e}")
+            return []
+    
+    def download_file(self, file_path: str, local_path: Path) -> bool:
+        """下载单个文件"""
+        try:
+            url = f"https://raw.githubusercontent.com/{self.repo}/{self.branch}/{file_path}"
+            response = requests.get(url, headers=self.headers, timeout=60)
             response.raise_for_status()
             
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            output_path.write_bytes(response.content)
-            
-            logger.info(f"⬇️  下载: {file_path} ({len(response.content)} bytes)")
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            local_path.write_bytes(response.content)
             return True
-            
         except Exception as e:
             logger.error(f"❌ 下载失败 {file_path}: {e}")
             return False
     
-    def _process_pdf_directly(self, pdf_path: Path, original_path: str, 
-                              is_update: bool = False) -> bool:
-        """
-        直接处理 PDF 文件（按页切分、生成 embedding、存储到 ChromaDB）
+    def _classify_file(self, file_path: str) -> Path:
+        """根据文件路径分类到本地目录"""
+        path_lower = file_path.lower()
         
-        这是方案 A：不再转换为 Markdown，而是直接解析 PDF 并存储向量
-        支持大文件分批处理和进度日志
-        
-        Args:
-            pdf_path: PDF 文件路径
-            original_path: 原始文件路径（用于元数据）
-            is_update: 是否是更新（True 会先删除旧向量）
-        """
-        try:
-            # 延迟导入，避免循环依赖
-            from knowledge_base.pdf_processor import PDFProcessor, PDFMetadata
-            from knowledge_base.kb_service import SimpleEmbedding, ChromaVectorStore
-            
-            logger.info(f"📄 直接处理 PDF: {pdf_path.name}")
-            
-            # 初始化组件（使用环境变量配置）
-            embedder = SimpleEmbedding(
-                model=os.environ.get("KB_EMBEDDING_MODEL", "nomic-embed-text"),
-                host=os.environ.get("KB_EMBEDDING_HOST", "http://localhost:11434")
-            )
-            vector_store = ChromaVectorStore()
-            pdf_workers = int(os.environ.get("KB_PDF_WORKERS", 0)) or None  # 0 表示使用默认值
-            processor = PDFProcessor(embedder=embedder, max_workers=pdf_workers)
-            
-            # 如果是更新，先删除旧向量
-            if is_update:
-                logger.info(f"   🗑️  检测到更新，清理旧向量: {original_path}")
-                try:
-                    deleted = vector_store.delete_by_source(original_path)
-                    logger.info(f"   ✅ 已清理旧向量")
-                except Exception as e:
-                    logger.warning(f"   ⚠️ 清理旧向量失败: {e}")
-            
-            # 从文件名提取元数据
-            metadata = processor.extract_metadata_from_filename(pdf_path.name)
-            # 添加原始路径信息
-            metadata.source = original_path
-            
-            # 定义进度回调
-            def progress_callback(current, total, stage):
-                if total > 0:
-                    percent = current / total * 100
-                    logger.info(f"   ⏳ {stage}: {current}/{total} ({percent:.1f}%)")
-            
-            # 处理并存储（多线程并行 + 进度回调）
-            stats = processor.process_and_store(
-                pdf_path,
-                vector_store,
-                metadata=metadata,
-                progress_callback=progress_callback,
-                use_parallel=True  # 启用多线程并行处理
-            )
-            
-            if stats['pages_stored'] > 0:
-                action = "更新" if is_update else "新增"
-                logger.info(f"   ✅ PDF {action}完成: {stats['pages_stored']}/{stats['pages_processed']} 页已存储")
-                if stats['batches'] > 1:
-                    logger.info(f"   📦 共分 {stats['batches']} 批处理")
-                success = True
-            else:
-                logger.warning(f"   ⚠️ PDF 未存储任何页面")
-                success = False
-            
-            # 清理临时PDF文件
-            try:
-                if pdf_path.exists():
-                    pdf_path.unlink()
-                    logger.debug(f"   🗑️ 临时PDF已清理: {pdf_path.name}")
-            except Exception as e:
-                logger.warning(f"   ⚠️ 临时PDF清理失败: {e}")
-            
-            return success
-                
-        except Exception as e:
-            logger.error(f"   ❌ PDF 直接处理失败: {e}")
-            import traceback
-            logger.debug(traceback.format_exc())
-            # 异常时也尝试清理临时文件
-            try:
-                if pdf_path.exists():
-                    pdf_path.unlink()
-            except:
-                pass
-            return False
-    
-    def convert_to_markdown(self, input_path: Path, output_path: Path) -> bool:
-        """将文件转换为 Markdown（仅用于非 PDF 文件）"""
-        ext = input_path.suffix.lower()
-        
-        try:
-            if ext == '.md':
-                # 直接复制
-                content = input_path.read_text(encoding='utf-8')
-                output_path.write_text(content, encoding='utf-8')
-                
-            elif ext == '.txt':
-                # 文本文件包装为 Markdown
-                content = input_path.read_text(encoding='utf-8')
-                md_content = f"# {input_path.stem}\n\n```\n{content}\n```\n"
-                output_path.write_text(md_content, encoding='utf-8')
-                
-            elif ext == '.docx':
-                # Word 文档转换（如果安装了 pandoc）
-                try:
-                    result = subprocess.run(
-                        ["pandoc", str(input_path), "-t", "markdown", "-o", str(output_path)],
-                        capture_output=True,
-                        timeout=30
-                    )
-                    if result.returncode != 0:
-                        # 失败则简单提取文本
-                        raise RuntimeError("pandoc failed")
-                except FileNotFoundError:
-                    # pandoc 未安装，使用 python-docx
-                    from docx import Document
-                    doc = Document(input_path)
-                    content = "\n".join([para.text for para in doc.paragraphs])
-                    md_content = f"# {input_path.stem}\n\n{content}\n"
-                    output_path.write_text(md_content, encoding='utf-8')
-            
-            logger.info(f"✅ 转换: {input_path.name} -> {output_path.name}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ 转换失败 {input_path}: {e}")
-            return False
-    
-    def _extract_text_content(self, file_path: Path, ext: str) -> str:
-        """从文件中提取文本内容"""
-        try:
-            if ext == '.md':
-                # Markdown 直接读取
-                return file_path.read_text(encoding='utf-8')
-                
-            elif ext == '.txt':
-                # 文本文件包装为 Markdown
-                content = file_path.read_text(encoding='utf-8')
-                return f"# {file_path.stem}\n\n```\n{content}\n```\n"
-                
-            elif ext == '.docx':
-                # Word 文档转换
-                try:
-                    # 尝试使用 pandoc
-                    result = subprocess.run(
-                        ["pandoc", str(file_path), "-t", "markdown"],
-                        capture_output=True,
-                        text=True,
-                        timeout=30
-                    )
-                    if result.returncode == 0:
-                        return result.stdout
-                    else:
-                        raise RuntimeError("pandoc failed")
-                except FileNotFoundError:
-                    # pandoc 未安装，使用 python-docx
-                    from docx import Document
-                    doc = Document(file_path)
-                    content = "\n".join([para.text for para in doc.paragraphs])
-                    return f"# {file_path.stem}\n\n{content}\n"
-            else:
-                # 其他类型尝试直接读取文本
-                return file_path.read_text(encoding='utf-8', errors='ignore')
-                
-        except Exception as e:
-            logger.error(f"提取文本失败 {file_path}: {e}")
-            return ""
-    
-    def _process_document_directly(self, file_path: Path, original_path: str, 
-                                   ext: str, is_update: bool = False) -> bool:
-        """
-        直接处理文档文件（Markdown/TXT/DOCX）存入 ChromaDB
-        
-        Args:
-            file_path: 临时文件路径
-            original_path: 原始文件路径（用于元数据）
-            ext: 文件扩展名
-            is_update: 是否是更新
-        """
-        try:
-            logger.info(f"📄 直接处理文档: {file_path.name}")
-            
-            # 延迟导入，避免循环依赖
-            from knowledge_base.kb_service import SimpleEmbedding, ChromaVectorStore
-            
-            # 初始化组件
-            embedder = SimpleEmbedding(
-                model=os.environ.get("KB_EMBEDDING_MODEL", "nomic-embed-text"),
-                host=os.environ.get("KB_EMBEDDING_HOST", "http://localhost:11434")
-            )
-            vector_store = ChromaVectorStore()
-            
-            # 如果是更新，先删除旧向量
-            if is_update:
-                logger.info(f"   🗑️  检测到更新，清理旧向量: {original_path}")
-                try:
-                    vector_store.delete_by_source(original_path)
-                except Exception as e:
-                    logger.warning(f"   ⚠️  清理旧向量失败: {e}")
-            
-            # 提取文本内容
-            content = self._extract_text_content(file_path, ext)
-            if not content.strip():
-                logger.warning(f"   ⚠️ 文档内容为空: {original_path}")
-                return False
-            
-            # 分段处理（如果内容很长）
-            max_chunk_size = 2000  # 每段最大字符数
-            chunks = []
-            
-            if len(content) <= max_chunk_size:
-                chunks = [content]
-            else:
-                # 按段落分割
-                paragraphs = content.split('\n\n')
-                current_chunk = ""
-                for para in paragraphs:
-                    if len(current_chunk) + len(para) + 2 <= max_chunk_size:
-                        current_chunk += para + "\n\n"
-                    else:
-                        if current_chunk:
-                            chunks.append(current_chunk.strip())
-                        current_chunk = para + "\n\n"
-                if current_chunk:
-                    chunks.append(current_chunk.strip())
-            
-            logger.info(f"   📝 文档分段: {len(chunks)} 段")
-            
-            # 生成 embedding 并存入 ChromaDB
-            stored_count = 0
-            for idx, chunk in enumerate(chunks, 1):
-                try:
-                    embedding = embedder.embed(chunk[:2000])
-                    
-                    # 构建元数据
-                    metadata = {
-                        "source": original_path,
-                        "chunk_index": idx,
-                        "total_chunks": len(chunks),
-                        "doc_type": "document",
-                        "file_ext": ext,
-                        "content_preview": chunk[:200],
-                        "processed_at": time.time()
-                    }
-                    
-                    # 添加芯片/类别信息
-                    path_lower = original_path.lower()
-                    if any(keyword in path_lower for keyword in ["chip", "芯片", "hardware", "datasheet"]):
-                        metadata["category"] = "chip_doc"
-                    else:
-                        metadata["category"] = "best_practice"
-                    
-                    vector_store.add_with_embedding(
-                        text=chunk,
-                        embedding=embedding,
-                        metadata=metadata
-                    )
-                    stored_count += 1
-                    
-                except Exception as e:
-                    logger.warning(f"   ⚠️ 段落 {idx} 处理失败: {e}")
-            
-            if stored_count > 0:
-                action = "更新" if is_update else "新增"
-                logger.info(f"   ✅ 文档 {action}完成: {stored_count}/{len(chunks)} 段已存储")
-                return True
-            else:
-                logger.warning(f"   ⚠️ 文档未存储任何段落")
-                return False
-                
-        except Exception as e:
-            logger.error(f"   ❌ 文档直接处理失败: {e}")
-            import traceback
-            logger.debug(traceback.format_exc())
-            return False
-    
-    def sync_files(self, files: List[Dict], force: bool = False) -> dict:
-        """同步文件到知识库
-        
-        Returns:
-            dict: 同步统计信息 {
-                'total': 总文件数,
-                'skipped': 跳过数,
-                'success': 成功数,
-                'failed': 失败数,
-                'details': []  # 每个文件的处理详情
-            }
-        """
-        # 加载同步状态
-        sync_state = self._load_sync_state()
-        
-        # 创建临时下载目录（使用环境变量配置）
-        temp_dir = Path(os.environ.get("GITHUB_AGENT_WORKDIR", "/tmp")) / "github_kb_sync"
-        temp_dir.mkdir(parents=True, exist_ok=True)
-        
-        # 统计信息
-        stats = {
-            'total': len(files),
-            'skipped': 0,
-            'success': 0,
-            'failed': 0,
-            'details': []
-        }
-        
-        logger.info(f"\n📋 开始处理 {len(files)} 个文件...")
-        
-        for i, file_info in enumerate(files, 1):
-            file_path = file_info["path"]
-            file_sha = file_info["sha"]
-            file_name = Path(file_path).name
-            
-            # 检查是否需要更新
+        # 根据路径关键词分类
+        if any(k in path_lower for k in ['chip', 'datasheet', 'sensor', 'mcu', 'cpu']):
+            return self.paths["chips"]
+        elif any(k in path_lower for k in ['practice', 'best', 'guide', 'tutorial', 'howto']):
+            return self.paths["practices"]
+        else:
+            # 根据文件扩展名默认分类
             ext = Path(file_path).suffix.lower()
-            is_pdf = (ext == '.pdf')
-            is_update = file_path in sync_state
-            
-            if not force and file_sha == sync_state.get(file_path):
-                # SHA 匹配，检查向量库中是否已存在
-                from knowledge_base.kb_service import ChromaVectorStore
-                try:
-                    vs = ChromaVectorStore()
-                    existing = vs.collection.get(
-                        where={"source": file_path},
-                        limit=1
-                    )
-                    if existing['ids']:
-                        file_type = 'pdf' if is_pdf else 'document'
-                        logger.info(f"  [{i}/{len(files)}] ⏭️  跳过（已同步）: {file_path}")
-                        stats['skipped'] += 1
-                        stats['details'].append({'file': file_path, 'status': 'skipped', 'type': file_type})
-                        continue
-                    else:
-                        logger.info(f"  [{i}/{len(files)}] 📝 重新处理（向量缺失）: {file_path}")
-                except Exception:
-                    logger.info(f"  [{i}/{len(files)}] 📝 重新处理（无法验证向量）: {file_path}")
-            
-            status_icon = "🆕" if file_path not in sync_state else "📝"
-            logger.info(f"  [{i}/{len(files)}] {status_icon} 处理中: {file_path}")
-            
-            # 确定目标目录
-            # 下载文件到临时目录
-            temp_file = temp_dir / Path(file_path).name
-            if not self.download_file(file_path, temp_file):
-                logger.error(f"       ❌ 下载失败: {file_path}")
-                stats['failed'] += 1
-                stats['details'].append({'file': file_path, 'status': 'failed', 'reason': 'download'})
-                continue
-            
-            # 根据文件类型处理
-            ext = Path(file_path).suffix.lower()
-            
             if ext == '.pdf':
-                # PDF 直接按页处理（方案A）
-                if self._process_pdf_directly(temp_file, file_path, is_update=is_update):
-                    sync_state[file_path] = file_sha
-                    stats['success'] += 1
-                    action_type = 'pdf_update' if is_update else 'pdf_new'
-                    stats['details'].append({'file': file_path, 'status': 'success', 'type': action_type})
-                else:
-                    logger.error(f"       ❌ PDF 处理失败: {file_path}")
-                    stats['failed'] += 1
-                    stats['details'].append({'file': file_path, 'status': 'failed', 'reason': 'pdf_process'})
-            else:
-                # 其他文件（Markdown/TXT/DOCX）直接处理存入 ChromaDB
-                if self._process_document_directly(temp_file, file_path, ext, is_update=is_update):
-                    sync_state[file_path] = file_sha
-                    stats['success'] += 1
-                    action_type = 'doc_update' if is_update else 'doc_new'
-                    stats['details'].append({'file': file_path, 'status': 'success', 'type': action_type})
-                else:
-                    logger.error(f"       ❌ 文档处理失败: {file_path}")
-                    stats['failed'] += 1
-                    stats['details'].append({'file': file_path, 'status': 'failed', 'reason': 'doc_process'})
-            
-            # 清理临时文件（PDF处理自己负责清理）
-            if ext != '.pdf':
-                temp_file.unlink(missing_ok=True)
-        
-        # 保存同步状态
-        self._save_sync_state(sync_state)
-        
-        # 打印统计摘要
-        logger.info(f"\n📊 同步统计:")
-        logger.info(f"   总计: {stats['total']} 个文件")
-        logger.info(f"   ⏭️  跳过: {stats['skipped']} 个（已是最新）")
-        logger.info(f"   ✅ 成功: {stats['success']} 个")
-        if stats['failed'] > 0:
-            logger.info(f"   ❌ 失败: {stats['failed']} 个")
-        
-        # 如果有新文件，通知 KB Service 重新加载
-        if stats['success'] > 0:
-            self._reload_kb_service()
-        
-        return stats
-    
-    def _reload_kb_service(self):
-        """通知 KB Service 重新加载知识库"""
-        import requests
-        
-        kb_url = os.environ.get("KB_SERVICE_URL", "http://localhost:8000")
-        
-        try:
-            logger.info("🔄 通知 KB Service 重新加载...")
-            response = requests.post(f"{kb_url}/reload", timeout=10)
-            if response.status_code == 200:
-                result = response.json()
-                logger.info(f"✅ KB Service 重新加载完成: {result.get('documents', 0)} 个文档")
-            else:
-                logger.warning(f"⚠️  KB Service 重新加载失败: {response.status_code}")
-        except Exception as e:
-            logger.warning(f"⚠️  无法连接 KB Service: {e}")
-            logger.info("💡 请手动重启服务以加载新文档")
+                return self.paths["chips"]
+            return self.paths["practices"]
     
     def _load_sync_state(self) -> Dict[str, str]:
         """加载同步状态"""
-        if SYNC_STATE_FILE.exists():
+        if self.paths["sync_state"].exists():
             try:
-                with open(SYNC_STATE_FILE) as f:
-                    return json.load(f)
-            except Exception:
+                return json.loads(self.paths["sync_state"].read_text())
+            except:
                 pass
         return {}
     
     def _save_sync_state(self, state: Dict[str, str]):
         """保存同步状态"""
-        SYNC_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        SYNC_STATE_FILE.write_text(json.dumps(state, indent=2))
+        self.paths["sync_state"].write_text(json.dumps(state, indent=2))
+    
+    def sync_files(self, files: List[dict]) -> dict:
+        """同步文件到本地"""
+        sync_state = self._load_sync_state()
+        stats = {'total': len(files), 'skipped': 0, 'success': 0, 'failed': 0}
+        
+        for file_info in files:
+            file_path = file_info["path"]
+            file_sha = file_info["sha"]
+            
+            # 检查是否需要更新
+            if file_path in sync_state and sync_state[file_path] == file_sha:
+                logger.debug(f"⏭️  跳过: {file_path}")
+                stats['skipped'] += 1
+                continue
+            
+            # 确定本地存储路径
+            target_dir = self._classify_file(file_path)
+            local_path = target_dir / Path(file_path).name
+            
+            is_update = file_path in sync_state
+            action = "更新" if is_update else "新增"
+            logger.info(f"🔄 {action}: {file_path}")
+            
+            # 下载文件
+            if self.download_file(file_path, local_path):
+                sync_state[file_path] = file_sha
+                stats['success'] += 1
+                logger.info(f"   ✅ 已保存到: {local_path}")
+            else:
+                stats['failed'] += 1
+        
+        self._save_sync_state(sync_state)
+        
+        # 打印统计
+        logger.info(f"\n📊 同步统计:")
+        logger.info(f"   总计: {stats['total']} 个")
+        logger.info(f"   ⏭️  跳过: {stats['skipped']} 个")
+        logger.info(f"   ✅ 成功: {stats['success']} 个")
+        if stats['failed'] > 0:
+            logger.info(f"   ❌ 失败: {stats['failed']} 个")
+        
+        # 通知 KB Service
+        if stats['success'] > 0:
+            self._notify_kb_reload()
+        
+        return stats
+    
+    def _notify_kb_reload(self):
+        """通知 KB Service 重新加载"""
+        try:
+            # 检查服务状态
+            resp = requests.get(f"{KB_SERVICE_URL}/health", timeout=5)
+            if resp.status_code != 200:
+                logger.warning("   KB Service 未运行")
+                return
+            
+            logger.info("🔄 通知 KB Service 重新加载...")
+            resp = requests.post(f"{KB_SERVICE_URL}/reload", timeout=30)
+            if resp.status_code == 200:
+                result = resp.json()
+                logger.info(f"✅ 重新加载完成")
+            else:
+                logger.warning(f"⚠️  重新加载失败: {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"⚠️  通知 KB Service 失败: {e}")
+            logger.info("   💡 请手动重启 KB Service")
+    
+    def run_sync(self) -> dict:
+        """执行完整同步"""
+        logger.info(f"🚀 开始同步仓库: {self.repo} ({self.branch})")
+        logger.info(f"   状态目录: {get_statedir()}")
+        
+        files = self.get_repo_files()
+        if not files:
+            logger.warning("⚠️  没有需要同步的文件")
+            return {'total': 0, 'skipped': 0, 'success': 0, 'failed': 0}
+        
+        return self.sync_files(files)
     
     def run_daemon(self, interval: int = 300):
-        """后台运行，定期检查更新"""
-        logger.info(f"👁️  开始监控仓库: {self.repo}")
+        """后台监控模式"""
+        logger.info(f"👁️  开始监控: {self.repo}")
         logger.info(f"   检查间隔: {interval} 秒")
-        logger.info(f"   按 Ctrl+C 停止")
+        logger.info(f"   状态目录: {get_statedir()}")
         
         try:
             while True:
                 logger.info(f"\n⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 检查更新...")
-                
-                files = self.get_repo_files()
-                if files:
-                    stats = self.sync_files(files)
-                    if stats['success'] > 0:
-                        logger.info(f"\n✅ 同步完成: {stats['success']} 个新文件")
-                        logger.info("🔄 请重启 KB Service 以加载新文档")
-                    elif stats['failed'] > 0:
-                        logger.warning(f"\n⚠️  同步完成，但有 {stats['failed']} 个文件失败")
-                    else:
-                        logger.info("\n✓ 所有文件已是最新")
-                
+                self.run_sync()
                 time.sleep(interval)
-                
         except KeyboardInterrupt:
             logger.info("\n✅ 监控已停止")
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="GitHub 仓库知识库同步工具"
-    )
-    parser.add_argument(
-        "--repo", "-r",
-        default=DEFAULT_REPO,
-        help=f"GitHub 仓库地址 (默认: {DEFAULT_REPO})"
-    )
-    parser.add_argument(
-        "--branch", "-b",
-        default=DEFAULT_BRANCH,
-        help=f"分支名称 (默认: {DEFAULT_BRANCH})"
-    )
-    parser.add_argument(
-        "--token", "-t",
-        help="GitHub Personal Access Token (也可设置 GITHUB_TOKEN 环境变量)"
-    )
-    parser.add_argument(
-        "--sync", "-s",
-        action="store_true",
-        help="立即同步一次"
-    )
-    parser.add_argument(
-        "--daemon", "-d",
-        action="store_true",
-        help="后台监控模式"
-    )
-    parser.add_argument(
-        "--interval", "-i",
-        type=int,
-        default=300,
-        help="检查间隔（秒），默认 300"
-    )
-    parser.add_argument(
-        "--force", "-f",
-        action="store_true",
-        help="强制重新同步所有文件"
-    )
-    parser.add_argument(
-        "--status",
-        action="store_true",
-        help="显示同步状态"
-    )
-    
+    parser = argparse.ArgumentParser(description="GitHub 知识库同步工具")
+    parser.add_argument("--repo", "-r", default=DEFAULT_REPO, help="仓库地址")
+    parser.add_argument("--branch", "-b", default=DEFAULT_BRANCH, help="分支")
+    parser.add_argument("--token", "-t", help="GitHub Token")
+    parser.add_argument("--sync", "-s", action="store_true", help="立即同步一次")
+    parser.add_argument("--daemon", "-d", action="store_true", help="后台监控")
+    parser.add_argument("--interval", "-i", type=int, default=300, help="检查间隔(秒)")
     args = parser.parse_args()
     
-    # 注意：知识库文件直接存入 ChromaDB，不再保存到本地目录
-    # KB_CHIPS_DIR 和 KB_PRACTICES_DIR 仅保留兼容性，不再使用
+    watcher = GitHubKBWatcher(repo=args.repo, branch=args.branch, token=args.token)
     
-    watcher = GitHubRepoWatcher(args.repo, args.branch, args.token)
-    
-    if args.status:
-        # 显示状态
-        state = watcher._load_sync_state()
-        files = watcher.get_repo_files()
-        
-        print(f"📊 同步状态: {args.repo}")
-        print(f"   远程文件: {len(files)}")
-        print(f"   已同步: {len(state)}")
-        
-        new_files = [f for f in files if f["path"] not in state]
-        if new_files:
-            print(f"\n🆕 新文件 ({len(new_files)}):")
-            for f in new_files[:10]:
-                print(f"   - {f['path']}")
-    
-    elif args.sync:
-        # 单次同步
-        logger.info(f"🔄 开始同步: {args.repo}")
-        files = watcher.get_repo_files()
-        if files:
-            stats = watcher.sync_files(files, args.force)
-            # 最终摘要
-            if stats['success'] > 0:
-                logger.info(f"\n✅ 同步成功: {stats['success']} 个新文件")
-                logger.info(f"💡 提示: 重启 KB Service 以加载新文档")
-            elif stats['failed'] > 0:
-                logger.error(f"\n❌ 同步失败: {stats['failed']} 个文件失败")
-            else:
-                logger.info(f"\n✓ 所有文件已是最新 ({stats['skipped']} 个)")
-    
+    if args.sync:
+        watcher.run_sync()
     elif args.daemon:
-        # 后台模式
-        watcher.run_daemon(args.interval)
-    
+        watcher.run_daemon(interval=args.interval)
     else:
         parser.print_help()
 

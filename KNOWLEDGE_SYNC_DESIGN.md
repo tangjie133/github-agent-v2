@@ -281,9 +281,10 @@ DOCX: GitHub → 本地文件 → KB Service加载 → ChromaDB ❌
 ### 环境变量
 
 ```bash
-# 存储路径
-KB_CHROMA_DIR=/home/tj/chroma_db
-GITHUB_AGENT_WORKDIR=/home/tj/github-agent-v2
+# 状态目录（所有数据统一存储在此目录下）
+# 知识库存储: ${GITHUB_AGENT_STATEDIR}/knowledge_base/
+# ChromaDB 存储: ${GITHUB_AGENT_STATEDIR}/chroma_db/
+# 同步状态: ${GITHUB_AGENT_STATEDIR}/.github_kb_sync_state.json
 GITHUB_AGENT_STATEDIR=/home/tj/state
 
 # PDF 处理

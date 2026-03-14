@@ -33,9 +33,7 @@ KB_REPO=tangjie133/knowledge-base    # 你的知识库仓库
 KB_BRANCH=main
 KB_GITHUB_TOKEN=ghp_xxx               # GitHub Token（可选，用于私有仓库）
 
-# 存储路径配置
-KB_CHROMA_DIR=/home/tj/chroma_db
-GITHUB_AGENT_WORKDIR=/home/tj/github-agent-v2
+# 状态目录配置（所有数据统一存储）
 GITHUB_AGENT_STATEDIR=/home/tj/state
 
 # 嵌入模型配置
@@ -45,8 +43,7 @@ KB_EMBEDDING_HOST=http://localhost:11434
 
 **创建必要目录：**
 ```bash
-mkdir -p /home/tj/chroma_db
-mkdir -p /home/tj/github-agent-v2
+mkdir -p /home/tj/state
 mkdir -p /home/tj/state
 ```
 

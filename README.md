@@ -266,8 +266,10 @@ KB_SERVICE_URL=http://localhost:8000
 # 推荐模型：bge-m3:latest (1024维，高精度)，nomic-embed-text:latest (768维，快速)
 KB_EMBEDDING_MODEL=bge-m3:latest
 
-# ChromaDB 向量数据库配置（统一存储所有文档类型）
-KB_CHROMA_DIR=/home/tj/chroma_db
+# 状态目录配置（所有数据统一存储）
+# 知识库存储: ${GITHUB_AGENT_STATEDIR}/knowledge_base/
+# ChromaDB 存储: ${GITHUB_AGENT_STATEDIR}/chroma_db/
+GITHUB_AGENT_STATEDIR=/home/tj/state
 
 # PDF 处理配置
 KB_PDF_WORKERS=6                       # PDF 处理线程数

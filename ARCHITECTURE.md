@@ -490,7 +490,8 @@ OPENCLAW_MODEL=kimi-k2.5
 # 知识库
 KB_SERVICE_URL=http://localhost:8000
 KB_EMBEDDING_MODEL=bge-m3:latest
-KB_CHROMA_DIR=/home/tj/chroma_db
+# 状态目录（知识库和 ChromaDB 统一存储在此目录下）
+GITHUB_AGENT_STATEDIR=/home/tj/state
 
 # 同步
 KB_GITHUB_SYNC_ENABLED=true

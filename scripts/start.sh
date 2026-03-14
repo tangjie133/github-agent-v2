@@ -213,8 +213,7 @@ check_env() {
     
     echo ""
     echo "  ${BOLD}工作目录:${NC}"
-    echo "    WORKDIR: ${GITHUB_AGENT_WORKDIR:-/tmp/github-agent-v2}"
-    echo "    STATEDIR: ${GITHUB_AGENT_STATEDIR:-$PROJECT_DIR/.github_kb_sync_state.json}"
+    echo "    STATEDIR: ${GITHUB_AGENT_STATEDIR:-/tmp/github-agent-state}"
     
     if is_debug; then
         echo ""
@@ -249,8 +248,6 @@ show_kb_status() {
         local stats=$(curl -s "$kb_url/stats" 2>/dev/null)
         local doc_count=$(echo "$stats" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('total_documents',0))" 2>/dev/null || echo "0")
         local model=$(echo "$stats" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('embedding_model','unknown'))" 2>/dev/null || echo "unknown")
-        local index_type=$(echo "$stats" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('vector_store',{}).get('index_type','unknown'))" 2>/dev/null || echo "unknown")
-        local dim=$(echo "$stats" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('vector_store',{}).get('dim','unknown'))" 2>/dev/null || echo "unknown")
         
         success "知识库服务就绪"
         echo ""
@@ -260,56 +257,12 @@ show_kb_status() {
         echo "    嵌入模型: ${CYAN}${model}${NC}"
         echo "    向量存储: ${GREEN}ChromaDB${NC} (持久化 + HNSW)"
         
-        # 显示维度信息
-        if [ "$dim" != "unknown" ] && [ "$dim" != "None" ]; then
-            echo "    向量维度: ${dim}"
-        fi
-        
-        # DEBUG 模式下显示更多信息
         if is_debug; then
             echo ""
             echo "  ${BOLD}DEBUG 详情:${NC}"
             echo "    KB_EMBEDDING_MODEL: ${KB_EMBEDDING_MODEL:-'(使用默认: nomic-embed-text)'}"
             echo "    KB_EMBEDDING_HOST: ${KB_EMBEDDING_HOST:-'(使用默认: http://localhost:11434)'}"
-            echo "    KB_DATA_DIR: ${KB_DATA_DIR:-'(使用默认: ./knowledge_base/data)'}"
-            echo "    KB_CHROMA_DIR: ${KB_CHROMA_DIR:-'(使用默认: ./knowledge_base/chroma_db)'}"
-            echo "    KB_CHIPS_DIR: ${KB_CHIPS_DIR:-'(使用默认: ./knowledge_base/chips)'}"
-            echo "    KB_PRACTICES_DIR: ${KB_PRACTICES_DIR:-'(使用默认: ./knowledge_base/best_practices)'}"
-            # 计算默认线程数（与 pdf_processor.py 逻辑一致）
-            CPU_COUNT=$(nproc 2>/dev/null || echo 4)
-            DEFAULT_PDF_WORKERS=$((CPU_COUNT / 3))
-            [ $DEFAULT_PDF_WORKERS -lt 4 ] && DEFAULT_PDF_WORKERS=4
-            echo "    KB_PDF_WORKERS: ${KB_PDF_WORKERS:-"(使用默认: $DEFAULT_PDF_WORKERS, CPU: $CPU_COUNT 核)"}"
-            echo "    KB_PDF_PARALLEL_THRESHOLD: ${KB_PDF_PARALLEL_THRESHOLD:-'(使用默认: 3页)'}"
-            # 根据模型显示预期维度
-            case "${KB_EMBEDDING_MODEL:-nomic-embed-text}" in
-                nomic-embed-text*) echo "    向量维度: 768 (预期)" ;;
-                bge-m3*) echo "    向量维度: 1024 (预期)" ;;
-                all-minilm*) echo "    向量维度: 384 (预期)" ;;
-                *) echo "    向量维度: 未知 (将在首次调用时检测)" ;;
-            esac
-        fi
-        
-        # 列出知识库文件（按目录统计）
-        local chips_count=$(find "$PROJECT_DIR/knowledge_base/chips" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
-        local practices_count=$(find "$PROJECT_DIR/knowledge_base/best_practices" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
-        local total_count=$((chips_count + practices_count))
-        
-        if [ "$total_count" -gt 0 ]; then
-            echo "    本地文件: ${BOLD}${total_count}${NC} 个 Markdown"
-            if is_debug; then
-                echo ""
-                echo "  ${BOLD}文件分布:${NC}"
-                echo "    chips/:          ${BOLD}${chips_count}${NC} 个"
-                echo "    best_practices/: ${BOLD}${practices_count}${NC} 个"
-                # 列出具体文件
-                echo ""
-                echo "  ${BOLD}文件列表:${NC}"
-                find "$PROJECT_DIR/knowledge_base" -name "*.md" 2>/dev/null | while read f; do
-                    local rel_path=$(echo "$f" | sed "s|$PROJECT_DIR/knowledge_base/||")
-                    echo "    • ${rel_path}"
-                done
-            fi
+            echo "    ChromaDB: ${GITHUB_AGENT_STATEDIR:-/tmp/github-agent-state}/chroma_db"
         fi
         echo ""
     else
@@ -327,7 +280,7 @@ show_kb_status() {
         echo "    1. 检查 KB Service 是否运行:"
         echo "       ${CYAN}curl ${kb_url}/health${NC}"
         echo "    2. 手动启动 KB Service:"
-        echo "       ${CYAN}python3 -m knowledge_base.kb_service${NC}"
+        echo "       ${CYAN}python3 knowledge_base/kb_service.py${NC}"
         echo "    3. 检查环境变量 KB_SERVICE_URL 配置"
         echo ""
     fi
@@ -386,18 +339,19 @@ start_kb_service() {
         success "${EMBED_MODEL} 模型已就绪"
     fi
     
-    # 后台启动 KB Service（使用 setsid 确保进程组分离）
+    # 后台启动 KB Service
     info "正在启动 KB Service $KB_HOST:$KB_PORT..."
     info "嵌入模型: ${EMBED_MODEL}"
+    info "状态目录: ${GITHUB_AGENT_STATEDIR:-/tmp/github-agent-state}"
     cd "$PROJECT_DIR"
     
-    # 使用 setsid 创建新的会话，确保进程在后台持续运行
-    # 传递嵌入模型配置和 ChromaDB 目录
-    setsid python3 -m knowledge_base.kb_service \
+    # 使用 nohup + & 后台运行
+    # 显式传递 GITHUB_AGENT_STATEDIR 环境变量
+    nohup env GITHUB_AGENT_STATEDIR="${GITHUB_AGENT_STATEDIR:-/tmp/github-agent-state}" \
+        python3 knowledge_base/kb_service.py \
         --host "$KB_HOST" \
         --port "$KB_PORT" \
-        --embedding-model "${EMBED_MODEL}" \
-        --chroma-dir "${KB_CHROMA_DIR:-/home/tj/chroma_db}" > /tmp/kb_service.log 2>&1 &
+        --embedding-model "${EMBED_MODEL}" > /tmp/kb_service.log 2>&1 &
     KB_PID=$!
     
     # 等待服务启动
@@ -428,7 +382,7 @@ start_kb_service() {
 # 停止 KB Service
 stop_kb_service() {
     info "停止 KB Service..."
-    pkill -f "knowledge_base.kb_service" 2>/dev/null || true
+    pkill -f "kb_service.py" 2>/dev/null || true
 }
 
 # 检查是否需要 GitHub 知识库同步
@@ -506,22 +460,6 @@ sync_github_kb_if_enabled() {
     
     if [ $sync_status -eq 0 ]; then
         success "同步完成"
-        
-        # 显示本地知识库统计
-        local md_count=$(find knowledge_base/chips knowledge_base/best_practices -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
-        local pdf_count=$(find knowledge_base/chips knowledge_base/best_practices -name "*.pdf" 2>/dev/null | wc -l | tr -d ' ')
-        
-        echo ""
-        echo "  ${BOLD}本地知识库统计:${NC}"
-        echo "    Markdown 文件: ${BOLD}${md_count}${NC}"
-        [ "$pdf_count" -gt 0 ] && echo "    PDF 文件: ${BOLD}${pdf_count}${NC}"
-        if is_debug; then
-            echo ""
-            echo "  ${BOLD}本地文件列表:${NC}"
-            find knowledge_base/chips knowledge_base/best_practices -name "*.md" 2>/dev/null | head -10 | while read f; do
-                echo "    • $(basename "$f")"
-            done
-        fi
         echo ""
     else
         warning "同步失败或部分失败"

@@ -1,56 +1,34 @@
 #!/usr/bin/env python3
 """
-PDF 处理器
+PDF 处理器 - 优化版本
+
+优化目标：
+1. chunk_size = 500, overlap = 80（减少 embedding 调用次数）
+2. 保留 section/标题信息
+3. 跳过目录页、版权页等无用内容
+4. 过滤过短文本（< 50）
 
 处理流程：
-1. 扫描/读取 PDF 文件
-2. 按页解析文本
-3. 每页生成 embedding
-4. 存储到向量数据库（带 metadata）
-
-Metadata 示例：
-{
-    "vendor": "espressif",
-    "chip": "esp32",
-    "page": 45,
-    "source": "esp32_datasheet.pdf",
-    "total_pages": 100
-}
-
-优化特性：
-- 异步处理：大文件后台处理
-- 进度日志：实时显示处理进度
-- 分批处理：避免内存溢出
-- 断点续传：支持中断后恢复
+PDF → 结构化文本 → chunk → embedding → Chroma
 """
 
-import os
 import re
-import hashlib
 import logging
 import time
-import threading
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple, Callable
-from dataclasses import dataclass
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Dict, Any, Optional
+from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
-class PDFPage:
-    """PDF 页面数据"""
+class PDFChunk:
+    """PDF 分块数据结构"""
     content: str
-    page_num: int
-    metadata: Dict[str, Any]
-    
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "content": self.content,
-            "page_num": self.page_num,
-            **self.metadata
-        }
+    page: int
+    section: str
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -60,732 +38,507 @@ class PDFMetadata:
     chip: str = "unknown"
     source: str = ""
     total_pages: int = 0
-    
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "vendor": self.vendor,
-            "chip": self.chip,
-            "source": self.source,
-            "total_pages": self.total_pages
-        }
 
 
 class PDFProcessor:
     """
-    PDF 处理器
+    PDF 处理器 - 优化版本
     
-    支持从 PDF 提取文本，按页切分，生成 embedding 并存储
-    优化特性：异步处理、进度日志、多线程并行（可配置）
+    参数：
+    - chunk_size: 500（平衡语义完整性和 embedding 调用次数）
+    - chunk_overlap: 80（保证上下文连贯）
+    - min_chunk_length: 50（过滤无效内容）
     """
     
-    # 默认配置（可从环境变量覆盖）
-    # 自动检测 CPU 核心数，合理配置线程数
-    import os as _os
-    _cpu_count = _os.cpu_count() or 4
-    # Ollama 并发性能测试：16并发可达 71 请求/秒
-    # 但 embed_batch 内部已经有8线程并发，所以 PDFProcessor 应该用较少线程
-    # 总并发度 = PDFProcessor线程数 × embed_batch并发数，建议控制在 16-24
-    DEFAULT_WORKERS = max(4, _cpu_count // 4)  # 默认 6 线程
-    DEFAULT_PARALLEL_THRESHOLD = 3   # 启用多线程的页数阈值（3页以上就并行）
-    LARGE_FILE_PAGES = 50            # 大文件阈值（页数）
-    BATCH_SIZE = 100                 # 分批处理大小（100页/批，大batch更高效）
-    PROGRESS_INTERVAL = 2            # 进度报告间隔（秒）
+    DEFAULT_CHUNK_SIZE = 500
+    DEFAULT_OVERLAP = 80
+    MIN_CHUNK_LENGTH = 50
     
-    def __init__(self, embedder=None, max_workers: int = None):
-        """
-        初始化 PDF 处理器
-        
-        Args:
-            embedder: 嵌入生成器（如 SimpleEmbedding 实例）
-            max_workers: 异步处理的最大线程数（默认从环境变量读取）
-        """
+    # 需要跳过的页面模式（目录、版权、法律声明等）
+    SKIP_PAGE_PATTERNS = [
+        r'^\s*Contents\s*$',
+        r'^\s*Table of Contents\s*$',
+        r'^\s*Copyright\s',
+        r'^\s*©\s*\d{4}',
+        r'^\s*Legal Notice',
+        r'^\s*Disclaimer',
+        r'^\s*Revision History',
+        r'^\s*Document History',
+        r'^\s*Ordering Information',
+        r'^\s*Contact Information',
+    ]
+    
+    # 页眉页脚模式（需要过滤）
+    HEADER_FOOTER_PATTERNS = [
+        r'BST-\w+-DS\d+-\d+.*?Revision.*\d+\.\d+',
+        r'Page\s+\d+\s+of\s+\d+',
+        r'^BMI160 Data sheet.*$',
+        r'^Bosch Sensortec',
+        r'©\s*Bosch Sensortec.*?reserved',
+        r'BOSCH and the symbol are registered trademarks',
+    ]
+    
+    def __init__(self, embedder=None, chunk_size: int = None, overlap: int = None):
         self.embedder = embedder
+        self.chunk_size = chunk_size or self.DEFAULT_CHUNK_SIZE
+        self.overlap = overlap or self.DEFAULT_OVERLAP
         
-        # 从环境变量读取线程数配置
-        if max_workers is None:
-            self.max_workers = int(os.environ.get("KB_PDF_WORKERS", self.DEFAULT_WORKERS))
-        else:
-            self.max_workers = max_workers
-        
-        # 从环境变量读取并行阈值
-        self.parallel_threshold = int(os.environ.get("KB_PDF_PARALLEL_THRESHOLD", self.DEFAULT_PARALLEL_THRESHOLD))
-        
-        logger.info(f"PDF 处理器配置: 线程数={self.max_workers}, 并行阈值={self.parallel_threshold}页")
-        
-        # 抑制 pdfminer 的 DEBUG 日志（避免输出过多解析细节）
-        logging.getLogger("pdfminer").setLevel(logging.WARNING)
-        logging.getLogger("pdfminer.pdfdocument").setLevel(logging.WARNING)
-        logging.getLogger("pdfminer.pdfpage").setLevel(logging.WARNING)
-        logging.getLogger("pdfminer.pdfparser").setLevel(logging.WARNING)
-        logging.getLogger("pdfminer.pdftypes").setLevel(logging.WARNING)
-        logging.getLogger("pdfminer.ccitt").setLevel(logging.WARNING)
-        
-        # 尝试导入 PDF 解析库
         try:
-            import pdfplumber
-            self._pdfplumber = pdfplumber
-            self._use_pdfplumber = True
-            logger.info("使用 pdfplumber 解析 PDF")
+            import fitz
+            self.fitz = fitz
         except ImportError:
-            try:
-                import PyPDF2
-                self._PyPDF2 = PyPDF2
-                self._use_pdfplumber = False
-                logger.info("使用 PyPDF2 解析 PDF（建议安装 pdfplumber 以获得更好效果）")
-            except ImportError:
-                raise RuntimeError("未找到 PDF 解析库，请安装: pip install pdfplumber PyPDF2")
-    
-    def _log_progress(self, current: int, total: int, stage: str, start_time: float):
-        """记录处理进度"""
-        elapsed = time.time() - start_time
-        percent = (current / total * 100) if total > 0 else 0
-        rate = current / elapsed if elapsed > 0 else 0
-        eta = (total - current) / rate if rate > 0 else 0
+            raise RuntimeError("PyMuPDF (fitz) 未安装: pip install pymupdf")
         
-        logger.info(f"📊 [{stage}] 进度: {current}/{total} ({percent:.1f}%) | "
-                   f"已用: {elapsed:.1f}s | 速率: {rate:.1f}页/s | 预计剩余: {eta:.1f}s")
+        # 编译正则表达式
+        self._skip_patterns = [re.compile(p, re.IGNORECASE) for p in self.SKIP_PAGE_PATTERNS]
+        self._header_patterns = [re.compile(p, re.IGNORECASE) for p in self.HEADER_FOOTER_PATTERNS]
+        
+        logger.info(f"PDF 处理器初始化: chunk_size={self.chunk_size}, overlap={self.overlap}")
     
     def extract_metadata_from_filename(self, filename: str) -> PDFMetadata:
-        """
-        从文件名提取元数据
-        
-        支持的命名格式：
-        - {vendor}_{chip}_datasheet.pdf (如: espressif_esp32_datasheet.pdf)
-        - {chip}_datasheet.pdf (如: esp32_datasheet.pdf)
-        - {vendor}_{chip}.pdf (如: espressif_esp32.pdf)
-        """
+        """从文件名提取 vendor 和 chip"""
         basename = Path(filename).stem.lower()
-        
-        # 尝试匹配 vendor_chip 格式
         parts = basename.replace('_datasheet', '').replace('-datasheet', '').split('_')
         
         if len(parts) >= 2:
             vendor = parts[0]
-            chip = '_'.join(parts[1:])  # 支持多部分芯片名
+            chip = '_'.join(parts[1:])
         else:
-            # 只有芯片名
             vendor = "unknown"
             chip = parts[0] if parts else "unknown"
         
-        # 清理芯片名（移除常见后缀）
+        # 清理版本号
         chip = re.sub(r'_(v?\d+\.?\d*|rev\d+|r\d+)$', '', chip, flags=re.I)
         
-        return PDFMetadata(
-            vendor=vendor,
-            chip=chip,
-            source=filename
-        )
+        return PDFMetadata(vendor=vendor, chip=chip, source=filename)
     
-    def parse_pdf(self, pdf_path: str | Path, metadata: Optional[PDFMetadata] = None) -> List[PDFPage]:
-        """
-        解析 PDF，按页返回内容
+    def _is_skip_page(self, text: str) -> bool:
+        """检测是否为需要跳过的页面（目录、版权等）"""
+        lines = text.strip().split('\n')[:10]  # 只看前10行
+        header_text = ' '.join(lines[:3])
         
-        Args:
-            pdf_path: PDF 文件路径
-            metadata: 预设的元数据（可选）
-            
-        Returns:
-            PDFPage 列表
-        """
-        pdf_path = Path(pdf_path)
-        
-        if not pdf_path.exists():
-            raise FileNotFoundError(f"PDF 文件不存在: {pdf_path}")
-        
-        # 如果没有提供元数据，从文件名提取
-        if metadata is None:
-            metadata = self.extract_metadata_from_filename(pdf_path.name)
-        
-        metadata.source = str(pdf_path.name)
-        
-        # 解析 PDF（优先使用 PyMuPDF，速度最快）
-        try:
-            import fitz
-            pages = self._parse_with_pymupdf(pdf_path, metadata)
-        except ImportError:
-            if self._use_pdfplumber:
-                pages = self._parse_with_pdfplumber(pdf_path, metadata)
-            else:
-                pages = self._parse_with_pypdf2(pdf_path, metadata)
-        
-        # 更新总页数
-        metadata.total_pages = len(pages)
-        for page in pages:
-            page.metadata["total_pages"] = len(pages)
-        
-        logger.info(f"PDF 解析完成: {pdf_path.name}, 共 {len(pages)} 页")
-        return pages
-    
-    def _parse_with_pdfplumber(self, pdf_path: Path, metadata: PDFMetadata) -> List[PDFPage]:
-        """使用 pdfplumber 解析 PDF（备用方案）"""
-        pages = []
-        
-        with self._pdfplumber.open(pdf_path) as pdf:
-            for i, page in enumerate(pdf.pages, 1):
-                text = page.extract_text()
-                
-                if text and text.strip():
-                    text = self._clean_text(text)
-                    
-                    page_data = PDFPage(
-                        content=text,
-                        page_num=i,
-                        metadata={
-                            "vendor": metadata.vendor,
-                            "chip": metadata.chip,
-                            "source": metadata.source,
-                            "page": i,
-                            "total_pages": 0
-                        }
-                    )
-                    pages.append(page_data)
-        
-        return pages
-    
-    def _parse_with_pymupdf(self, pdf_path: Path, metadata: PDFMetadata) -> List[PDFPage]:
-        """使用 PyMuPDF (fitz) 解析 PDF（更快）"""
-        import fitz  # PyMuPDF
-        pages = []
-        
-        with fitz.open(pdf_path) as pdf:
-            for i in range(len(pdf)):
-                page = pdf[i]
-                text = page.get_text()
-                
-                if text and text.strip():
-                    text = self._clean_text(text)
-                    
-                    page_data = PDFPage(
-                        content=text,
-                        page_num=i+1,
-                        metadata={
-                            "vendor": metadata.vendor,
-                            "chip": metadata.chip,
-                            "source": metadata.source,
-                            "page": i+1,
-                            "total_pages": len(pdf)
-                        }
-                    )
-                    pages.append(page_data)
-        
-        return pages
-    
-    def _parse_with_pypdf2(self, pdf_path: Path, metadata: PDFMetadata) -> List[PDFPage]:
-        """使用 PyPDF2 解析 PDF（降级方案）"""
-        pages = []
-        
-        with open(pdf_path, 'rb') as f:
-            reader = self._PyPDF2.PdfReader(f)
-            
-            for i, page in enumerate(reader.pages, 1):
-                text = page.extract_text()
-                
-                if text and text.strip():
-                    text = self._clean_text(text)
-                    
-                    page_data = PDFPage(
-                        content=text,
-                        page_num=i,
-                        metadata={
-                            "vendor": metadata.vendor,
-                            "chip": metadata.chip,
-                            "source": metadata.source,
-                            "page": i,
-                            "total_pages": len(reader.pages)
-                        }
-                    )
-                    pages.append(page_data)
-        
-        return pages
+        for pattern in self._skip_patterns:
+            if pattern.search(header_text):
+                return True
+        return False
     
     def _clean_text(self, text: str) -> str:
-        """
-        清理提取的文本 - 增强版（针对 BMI160 等 datasheet 优化）
+        """清理页眉页脚等多余内容"""
+        # 移除页眉页脚
+        for pattern in self._header_patterns:
+            text = pattern.sub('', text)
         
-        移除内容：
-        1. 页眉（文档编号、版本、日期、厂商）
-        2. 页脚（页码）
-        3. 版权声明
-        4. 商标声明
-        5. 注意事项
+        # 清理多余空白
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        text = re.sub(r'[ \t]+', ' ', text)
+        
+        return text.strip()
+    
+    def _split_into_sentences(self, text: str) -> List[str]:
+        """将文本分割为句子列表（不使用 look-behind）"""
+        # 使用简单的标点分割，保留标点
+        sentences = []
+        current = []
+        
+        for char in text:
+            current.append(char)
+            if char in '.!?。':
+                # 检查后面是否是空白或结束
+                sentences.append(''.join(current).strip())
+                current = []
+        
+        # 添加最后一部分
+        if current:
+            remainder = ''.join(current).strip()
+            if remainder:
+                sentences.append(remainder)
+        
+        return sentences if sentences else [text]
+    
+    def extract_structure(self, pdf_path: Path) -> List[Dict[str, Any]]:
         """
-        if not text:
+        提取 PDF 结构化内容
+        
+        Returns:
+            页面结构化数据列表，每个页面包含：
+            - page_num: 页码
+            - text: 清理后的文本
+            - section: 当前章节标题
+            - is_content: 是否有实质内容（非目录/版权页）
+        """
+        pages = []
+        current_section = "General"
+        
+        with self.fitz.open(pdf_path) as doc:
+            for page_num in range(len(doc)):
+                page = doc[page_num]
+                
+                # 提取带格式的文本块
+                blocks = page.get_text("dict").get("blocks", [])
+                
+                page_lines = []
+                page_section = current_section
+                has_title = False
+                
+                for block in blocks:
+                    if "lines" not in block:
+                        continue
+                    
+                    for line in block["lines"]:
+                        if not line.get("spans"):
+                            continue
+                        
+                        # 提取文本
+                        text = "".join([s.get("text", "") for s in line["spans"]]).strip()
+                        if not text or len(text) < 2:
+                            continue
+                        
+                        # 分析格式（字体大小、是否粗体）
+                        first_span = line["spans"][0]
+                        font_size = first_span.get("size", 11)
+                        flags = first_span.get("flags", 0)
+                        is_bold = bool(flags & 2**4) or "bold" in first_span.get("font", "").lower()
+                        
+                        # 标题检测（大字体或粗体）
+                        if font_size > 13 or (font_size > 11 and is_bold):
+                            # 更新章节标题
+                            page_section = text
+                            current_section = text
+                            has_title = True
+                            # 标题前加标记便于后续处理
+                            page_lines.append(f"##SECTION##{text}")
+                        else:
+                            page_lines.append(text)
+                
+                # 合并页面文本
+                raw_text = '\n'.join(page_lines)
+                cleaned_text = self._clean_text(raw_text)
+                
+                # 检测是否为内容页（非目录/版权页）
+                is_content = not self._is_skip_page(cleaned_text) and len(cleaned_text) > 100
+                
+                pages.append({
+                    "page_num": page_num + 1,
+                    "text": cleaned_text,
+                    "section": page_section,
+                    "is_content": is_content,
+                    "has_title": has_title
+                })
+        
+        return pages
+    
+    def create_chunks(self, pages: List[Dict[str, Any]], metadata: PDFMetadata) -> List[PDFChunk]:
+        """
+        从结构化页面创建 chunks
+        
+        策略：
+        1. 跳过非内容页（目录、版权）
+        2. 按 section 分组，保持语义完整性
+        3. chunk_size=500, overlap=80
+        4. 过滤长度 < 50 的 chunk
+        """
+        chunks = []
+        
+        # 过滤内容页
+        content_pages = [p for p in pages if p["is_content"]]
+        
+        if not content_pages:
+            logger.warning("未检测到有效内容页")
+            return chunks
+        
+        logger.info(f"处理 {len(content_pages)}/{len(pages)} 个内容页")
+        
+        # 按 section 分组处理
+        current_section = "General"
+        section_buffer = []
+        section_start_page = 1
+        
+        def flush_section_buffer():
+            """将当前 section buffer 分块并保存"""
+            nonlocal section_buffer, section_start_page
+            
+            if not section_buffer:
+                return
+            
+            # 合并 section 内文本
+            full_text = '\n\n'.join(section_buffer)
+            
+            # 如果整个 section 很短，作为一个 chunk
+            if len(full_text) <= self.chunk_size:
+                if len(full_text) >= self.MIN_CHUNK_LENGTH:
+                    chunks.append(PDFChunk(
+                        content=full_text,
+                        page=section_start_page,
+                        section=current_section,
+                        metadata={
+                            "source": metadata.source,
+                            "vendor": metadata.vendor,
+                            "chip": metadata.chip,
+                        }
+                    ))
+                section_buffer = []
+                return
+            
+            # 长 section 需要分割
+            # 按段落分割，段落过长再按句子分割
+            paragraphs = full_text.split('\n\n')
+            
+            chunk_parts = []
+            chunk_size = 0
+            chunk_start_page = section_start_page
+            
+            for para in paragraphs:
+                para = para.strip()
+                if not para:
+                    continue
+                
+                # 如果段落本身超过 chunk_size，按句子分割
+                if len(para) > self.chunk_size:
+                    sentences = self._split_into_sentences(para)
+                    for sent in sentences:
+                        sent = sent.strip()
+                        if not sent:
+                            continue
+                        
+                        # 检查是否需要新建 chunk
+                        if chunk_size + len(sent) > self.chunk_size and chunk_parts:
+                            # 保存当前 chunk
+                            content = ' '.join(chunk_parts).strip()
+                            if len(content) >= self.MIN_CHUNK_LENGTH:
+                                chunks.append(PDFChunk(
+                                    content=content,
+                                    page=chunk_start_page,
+                                    section=current_section,
+                                    metadata={
+                                        "source": metadata.source,
+                                        "vendor": metadata.vendor,
+                                        "chip": metadata.chip,
+                                    }
+                                ))
+                            
+                            # 创建重叠
+                            overlap_text = self._calc_overlap(chunk_parts)
+                            chunk_parts = [overlap_text, sent] if overlap_text else [sent]
+                            chunk_size = sum(len(p) for p in chunk_parts)
+                        else:
+                            chunk_parts.append(sent)
+                            chunk_size += len(sent)
+                else:
+                    # 正常段落处理
+                    if chunk_size + len(para) > self.chunk_size and chunk_parts:
+                        # 保存当前 chunk
+                        content = '\n\n'.join(chunk_parts).strip()
+                        if len(content) >= self.MIN_CHUNK_LENGTH:
+                            chunks.append(PDFChunk(
+                                content=content,
+                                page=chunk_start_page,
+                                section=current_section,
+                                metadata={
+                                    "source": metadata.source,
+                                    "vendor": metadata.vendor,
+                                    "chip": metadata.chip,
+                                }
+                            ))
+                        
+                        # 创建重叠
+                        overlap_text = self._calc_overlap(chunk_parts)
+                        chunk_parts = [overlap_text, para] if overlap_text else [para]
+                        chunk_size = sum(len(p) for p in chunk_parts)
+                    else:
+                        chunk_parts.append(para)
+                        chunk_size += len(para)
+            
+            # 保存最后一个 chunk
+            if chunk_parts:
+                content = '\n\n'.join(chunk_parts).strip() if len(chunk_parts) > 1 else chunk_parts[0].strip()
+                if len(content) >= self.MIN_CHUNK_LENGTH:
+                    chunks.append(PDFChunk(
+                        content=content,
+                        page=chunk_start_page,
+                        section=current_section,
+                        metadata={
+                            "source": metadata.source,
+                            "vendor": metadata.vendor,
+                            "chip": metadata.chip,
+                        }
+                    ))
+            
+            section_buffer = []
+        
+        # 遍历所有内容页
+        for page in content_pages:
+            page_section = page["section"]
+            page_text = page["text"]
+            page_num = page["page_num"]
+            
+            # section 变化时，先处理之前的 buffer
+            if page_section != current_section and section_buffer:
+                flush_section_buffer()
+                current_section = page_section
+                section_start_page = page_num
+            
+            # 提取正文（移除 section 标记）
+            text_lines = []
+            for line in page_text.split('\n'):
+                if line.startswith("##SECTION##"):
+                    # section 标题单独一行
+                    section_name = line[11:]  # 移除标记
+                    if section_name != current_section:
+                        flush_section_buffer()
+                        current_section = section_name
+                        section_start_page = page_num
+                    text_lines.append(section_name)
+                else:
+                    text_lines.append(line)
+            
+            paragraph = '\n'.join(text_lines).strip()
+            if paragraph:
+                section_buffer.append(paragraph)
+        
+        # 处理最后一个 section
+        flush_section_buffer()
+        
+        return chunks
+    
+    def _calc_overlap(self, parts: List[str]) -> str:
+        """计算重叠文本（约 80 字符）"""
+        if not parts:
             return ""
         
-        # 保存原始长度用于检查
-        original_len = len(text)
+        # 从后往前拼接，直到达到 overlap 大小
+        overlap_parts = []
+        total = 0
         
-        # ===== 1. 首先进行全文模式替换（处理页眉和内容在同一行的情况）=====
-        # 这是关键：BMI160 的页眉很长，可能和正文连在一起
+        for part in reversed(parts):
+            part_len = len(part)
+            if total + part_len > self.overlap:
+                # 如果当前部分太长，截断
+                if total == 0:
+                    return part[-self.overlap:]
+                break
+            overlap_parts.insert(0, part)
+            total += part_len
         
-        # 模式：BMI160 Data sheet Page X BST-XXX... 一直到 notice.
-        header_full_pattern = (
-            r'BMI160 Data sheet Page \d+ BST-[^|]+\| Revision \d+\.\d+ \| [^©]+© '  # 开头
-            r'Bosch Sensortec[^.]*\. '  # 厂商
-            r'© Bosch Sensortec GmbH reserves all rights[^.]*\. '  # 版权1
-            r'We reserve all rights of disposal[^.]*\. '  # 版权2
-            r'BOSCH and the symbol are registered trademarks[^.]*\. '  # 商标
-            r'Note: Specifications within this document are preliminary[^.]*\.'  # 注意
-        )
-        
-        # 尝试匹配完整的页眉块
-        text = re.sub(header_full_pattern, ' ', text, flags=re.IGNORECASE | re.DOTALL)
-        
-        # 再次尝试更宽松的模式（针对可能的变体）
-        # 从 "BMI160 Data sheet" 到 "notice." 之间的所有内容
-        loose_header_pattern = (
-            r'BMI160 Data sheet Page \d+[^.]*?'  # 开头到页码
-            r'© Bosch Sensortec GmbH.*?notice\.'  # 版权到 notice
-        )
-        text = re.sub(loose_header_pattern, ' ', text, flags=re.IGNORECASE | re.DOTALL)
-        
-        # ===== 2. 逐行清理（处理单独的页眉行）=====
-        lines = text.split('\n')
-        cleaned_lines = []
-        
-        header_patterns = [
-            # BST-BMI160-DS000-07 | Revision 0.8 | February 2015 Bosch Sensortec
-            r'BST-\w+-DS\d+-\d+.*?\|.*?Revision.*?\d+\.\d+',
-            # Page X BST-XXX 模式
-            r'Page\s+\d+\s+BST-[^\n]*',
-            # 文档标题行
-            r'^BMI160 Data sheet.*$',
-            r'^\d+\s*\|\s*BST-[^\n]*$',
-            # 厂商名称行
-            r'^Bosch Sensortec.*$',
-            # 版权相关行
-            r'©\s*Bosch Sensortec',
-            r'reserves all rights',
-            r'rights of disposal',
-            r'registered trademarks',
-            r'Specifications within this document',
-        ]
-        
-        footer_patterns = [
-            r'Page\s+\d+\s+of\s+\d+',
-            r'^\s*\d+\s*$',  # 单独页码
-        ]
-        
-        for line in lines:
-            line_stripped = line.strip()
-            if not line_stripped:
-                continue
-                
-            # 检查是否为页眉行
-            is_header = False
-            for pattern in header_patterns:
-                if re.search(pattern, line_stripped, re.IGNORECASE):
-                    is_header = True
-                    break
-            
-            # 检查是否为页脚行
-            is_footer = False
-            for pattern in footer_patterns:
-                if re.search(pattern, line_stripped, re.IGNORECASE):
-                    is_footer = True
-                    break
-            
-            if not is_header and not is_footer:
-                cleaned_lines.append(line)
-        
-        text = '\n'.join(cleaned_lines)
-        
-        # ===== 3. 再次进行全文清理（捕获遗漏的）=====
-        copyright_patterns = [
-            # © Bosch Sensortec GmbH reserves all rights...
-            r'©\s*Bosch Sensortec GmbH.*?rights? reserved[^.]*\.',
-            r'Bosch Sensortec GmbH reserves all rights[^.]*\.',
-            r'We reserve all rights of disposal[^.]*\.',
-            # BOSCH and the symbol are registered trademarks...
-            r'BOSCH and the symbol are registered trademarks[^.]*\.',
-            r'Note: Specifications within this document are preliminary[^.]*\.',
-        ]
-        
-        for pattern in copyright_patterns:
-            text = re.sub(pattern, ' ', text, flags=re.IGNORECASE | re.DOTALL)
-        
-        # ===== 4. 移除修订版本行 =====
-        text = re.sub(r'Revision\s+\d+\.\d+[^\n]*', ' ', text, flags=re.IGNORECASE)
-        
-        # ===== 5. 清理多余空白 =====
-        text = re.sub(r'[ \t]+', ' ', text)  # 多个空格/制表符 -> 单个空格
-        text = re.sub(r'\n{3,}', '\n\n', text)  # 最多保留2个换行
-        text = text.strip()
-        
-        # ===== 6. 如果清理后太短，可能是清理过度，返回原始文本的基本清理 =====
-        if len(text) < original_len * 0.05:  # 降低到 5%
-            # 基本清理：只移除多余空格
-            text = re.sub(r'[ \t]+', ' ', text)
-            text = text.strip()
-        
-        return text
+        if len(overlap_parts) == 1:
+            return overlap_parts[0]
+        return '\n\n'.join(overlap_parts) if '\n\n' in parts[0] else ' '.join(overlap_parts)
     
-    def process_and_store(self, pdf_path: str | Path, vector_store, 
-                          metadata: Optional[PDFMetadata] = None,
-                          progress_callback: Optional[Callable] = None,
-                          use_parallel: bool = True) -> Dict[str, Any]:
+    def process_pdf(self, pdf_path: Path, metadata: Optional[PDFMetadata] = None) -> List[PDFChunk]:
         """
-        处理 PDF 并存储到向量数据库（优化版：流式并行处理）
+        处理 PDF 文件
         
-        性能优化策略：
-        1. 流式处理：边解析边 embedding，不等待全部解析完成
-        2. 批量 embedding：一次请求处理多个页面，减少网络开销
-        3. 双流水线：解析线程 + 批量处理线程池并行工作
-        
-        Args:
-            pdf_path: PDF 文件路径
-            vector_store: 向量存储实例（如 ChromaVectorStore）
-            metadata: 预设元数据（可选）
-            progress_callback: 进度回调函数(current, total, stage)
-            use_parallel: 是否使用多线程并行处理
-            
-        Returns:
-            处理统计信息
+        流程：
+        1. 提取结构化内容（跳过目录/版权页）
+        2. 按 section 分块（size=500, overlap=80）
+        3. 过滤短文本（<50）
         """
-        if self.embedder is None:
-            raise ValueError("需要提供 embedder 才能生成 embedding")
-        
         pdf_path = Path(pdf_path)
-        stats = {"pages_processed": 0, "pages_stored": 0, "errors": [], "batches": 0}
-        start_time = time.time()
+        if not pdf_path.exists():
+            raise FileNotFoundError(f"PDF 不存在: {pdf_path}")
         
-        try:
-            logger.info(f"📖 开始处理 PDF: {pdf_path.name} | 大小: {pdf_path.stat().st_size / 1024:.1f} KB")
-            
-            # 使用流式并行处理
-            if use_parallel:
-                logger.info(f"🚀 启用流式并行处理: {self.max_workers} 线程 | 批大小: {self.BATCH_SIZE}")
-                stats["mode"] = "streaming_parallel"
-                self._process_streaming_parallel(pdf_path, vector_store, metadata, stats, progress_callback, start_time)
-            else:
-                # 降级到顺序处理
-                logger.info(f"⚙️ 单线程顺序处理")
-                pages = self.parse_pdf(pdf_path, metadata)
-                stats["pages_processed"] = len(pages)
-                stats["mode"] = "sequential"
-                self._process_pages_sequential(pages, vector_store, stats, progress_callback, start_time)
-            
-            # 完成总结
-            total_time = time.time() - start_time
-            avg_time = total_time / stats["pages_stored"] if stats["pages_stored"] > 0 else 0
-            
-            logger.info(f"🎉 PDF 处理完成: {pdf_path.name}")
-            logger.info(f"   📊 统计: 存储 {stats['pages_stored']}/{stats['pages_processed']} 页 | "
-                       f"批次数: {stats['batches']} | 错误: {len(stats['errors'])}")
-            logger.info(f"   ⏱️ 性能: 总耗时 {total_time:.2f}s | 平均每页 {avg_time:.2f}s | "
-                       f"处理速率: {stats['pages_stored']/total_time:.2f} 页/s")
-            
-        except Exception as e:
-            stats["errors"].append(f"PDF 处理失败: {e}")
-            logger.error(f"❌ PDF 处理失败 {pdf_path}: {e}")
+        if metadata is None:
+            metadata = self.extract_metadata_from_filename(pdf_path.name)
+        metadata.source = pdf_path.name
+        
+        logger.info(f"📖 处理 PDF: {pdf_path.name}")
+        
+        # 1. 提取结构化内容
+        pages = self.extract_structure(pdf_path)
+        content_pages = [p for p in pages if p["is_content"]]
+        
+        # 2. 创建 chunks
+        chunks = self.create_chunks(pages, metadata)
+        
+        # 统计
+        if chunks:
+            sizes = [len(c.content) for c in chunks]
+            avg_size = sum(sizes) / len(sizes)
+            logger.info(f"   内容页: {len(content_pages)}/{len(pages)}")
+            logger.info(f"   Chunks: {len(chunks)} 个")
+            logger.info(f"   平均大小: {avg_size:.0f} 字符")
+            logger.info(f"   大小范围: [{min(sizes)}, {max(sizes)}]")
+        
+        return chunks
+    
+    def store_chunks(self, chunks: List[PDFChunk], vector_store) -> Dict[str, Any]:
+        """存储 chunks 到向量库"""
+        if not self.embedder:
+            raise ValueError("需要提供 embedder")
+        
+        stats = {"chunks_processed": len(chunks), "chunks_stored": 0, "errors": []}
+        
+        for i, chunk in enumerate(chunks):
+            try:
+                # 生成 embedding（限制长度）
+                text_for_embed = chunk.content[:2500]  # 留足余量
+                embedding = self.embedder.embed(text_for_embed)
+                
+                # 验证 embedding
+                if not self._is_valid(embedding):
+                    logger.warning(f"Chunk {i}: embedding 无效，跳过")
+                    continue
+                
+                # 存储
+                vector_store.add_with_embedding(
+                    text=chunk.content,
+                    embedding=embedding,
+                    metadata={
+                        **chunk.metadata,
+                        "page": chunk.page,
+                        "section": chunk.section,
+                        "chunk_index": i,
+                        "total_chunks": len(chunks),
+                    }
+                )
+                stats["chunks_stored"] += 1
+                
+            except Exception as e:
+                logger.error(f"Chunk {i} 存储失败: {e}")
+                stats["errors"].append(f"chunk {i}: {str(e)[:50]}")
         
         return stats
     
-    def _process_streaming_parallel(self, pdf_path: Path, vector_store, metadata: Optional[PDFMetadata],
-                                     stats: dict, progress_callback: Optional[Callable], start_time: float):
+    def process_and_store(self, pdf_path: Path, vector_store,
+                          metadata: Optional[PDFMetadata] = None) -> Dict[str, Any]:
         """
-        流式并行处理 PDF
-        
-        针对 Ollama embedding 服务优化：
-        - 单 Ollama 实例：6-8 线程最佳（避免竞争）
-        - 多 Ollama 实例：可线性增加线程数
-        - 批处理：每批 20 页，平衡内存和网络效率
+        完整流程：PDF → 结构化文本 → Chunks → Embedding → Chroma
         """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        import threading
+        start = time.time()
         
-        # 准备元数据
-        if metadata is None:
-            metadata = self.extract_metadata_from_filename(pdf_path.name)
-        metadata.source = str(pdf_path.name)
+        chunks = self.process_pdf(pdf_path, metadata)
+        stats = self.store_chunks(chunks, vector_store)
         
-        # 解析 PDF（使用PyMuPDF，比pdfplumber快3-5倍）
-        logger.info(f"📖 解析PDF中...")
-        pages = []
-        try:
-            import fitz
-            with fitz.open(pdf_path) as pdf:
-                for i in range(len(pdf)):
-                    page = pdf[i]
-                    text = page.get_text()
-                    if text and text.strip():
-                        text = self._clean_text(text)
-                        pages.append(PDFPage(
-                            content=text,
-                            page_num=i+1,
-                            metadata={
-                                "vendor": metadata.vendor,
-                                "chip": metadata.chip,
-                                "source": metadata.source,
-                                "page": i+1,
-                                "total_pages": len(pdf)
-                            }
-                        ))
-        except ImportError:
-            with self._pdfplumber.open(pdf_path) as pdf:
-                for i, page in enumerate(pdf.pages, 1):
-                    text = page.extract_text()
-                    if text and text.strip():
-                        text = self._clean_text(text)
-                        pages.append(PDFPage(
-                            content=text,
-                            page_num=i,
-                            metadata={
-                                "vendor": metadata.vendor,
-                                "chip": metadata.chip,
-                                "source": metadata.source,
-                                "page": i,
-                                "total_pages": len(pdf.pages)
-                            }
-                        ))
+        elapsed = time.time() - start
+        logger.info(f"✅ {pdf_path.name}: {stats['chunks_stored']}/{stats['chunks_processed']} chunks, {elapsed:.1f}s")
         
-        total_pages = len(pages)
-        stats["pages_processed"] = total_pages
-        
-        if total_pages == 0:
-            logger.warning("没有解析到任何页面")
-            return
-        
-        logger.info(f"🚀 开始并行处理: {total_pages} 页 | {self.max_workers} 线程 | 批大小: {self.BATCH_SIZE}")
-        
-        # 将页面分组
-        batches = []
-        for i in range(0, total_pages, self.BATCH_SIZE):
-            batches.append(pages[i:i+self.BATCH_SIZE])
-        
-        stats["batches"] = len(batches)
-        
-        # 处理单个批次
-        def process_batch(batch_idx: int, batch: List[PDFPage]) -> Tuple[int, int, int]:
-            """处理一个批次，返回 (成功数, 失败数, 批次索引)"""
-            success = 0
-            failed = 0
-            
-            # 批量 embedding
-            texts = [p.content[:2000] for p in batch]
-            try:
-                # 使用 embedder 的批量方法（内部有并发）
-                embeddings = self.embedder.embed_batch(texts, max_workers=min(8, len(texts)))
-            except Exception as e:
-                logger.warning(f"批次 {batch_idx} 批量embedding失败，降级到单条: {e}")
-                embeddings = []
-                for t in texts:
-                    try:
-                        emb = self.embedder.embed(t)
-                        embeddings.append(emb)
-                    except:
-                        embeddings.append(None)
-            
-            # 存储结果
-            for page, embedding in zip(batch, embeddings):
-                if embedding is None:
-                    failed += 1
-                    continue
-                try:
-                    doc_id = self._generate_doc_id(page)
-                    meta = {
-                        **page.metadata,
-                        "doc_id": doc_id,
-                        "content_preview": page.content[:200],
-                        "processed_at": time.time()
-                    }
-                    vector_store.add_with_embedding(
-                        text=page.content,
-                        embedding=embedding,
-                        metadata=meta
-                    )
-                    success += 1
-                except Exception as e:
-                    failed += 1
-                    stats["errors"].append(f"页面 {page.page_num}: {str(e)[:50]}")
-            
-            return success, failed, batch_idx
-        
-        # 使用线程池并行处理批次
-        stored_count = 0
-        failed_count = 0
-        processed_batches = 0
-        lock = threading.Lock()
-        last_progress_time = start_time
-        
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            future_to_batch = {
-                executor.submit(process_batch, i, batch): i 
-                for i, batch in enumerate(batches)
-            }
-            
-            for future in as_completed(future_to_batch):
-                batch_idx = future_to_batch[future]
-                success, failed, _ = future.result()
-                
-                with lock:
-                    stored_count += success
-                    failed_count += failed
-                    processed_batches += 1
-                    
-                    # 进度回调
-                    if progress_callback:
-                        progress_callback(stored_count, total_pages, "embedding")
-                    
-                    # 定期报告
-                    current_time = time.time()
-                    if current_time - last_progress_time >= self.PROGRESS_INTERVAL:
-                        elapsed = current_time - start_time
-                        rate = (stored_count + failed_count) / elapsed if elapsed > 0 else 0
-                        progress_pct = stored_count / total_pages * 100
-                        logger.info(f"   ⏳ 进度: {processed_batches}/{len(batches)} 批 "
-                                   f"({progress_pct:.1f}%) | "
-                                   f"速率: {rate:.1f} 页/s | "
-                                   f"成功: {stored_count} 失败: {failed_count}")
-                        last_progress_time = current_time
-        
-        stats["pages_stored"] = stored_count
-        
-        if progress_callback:
-            progress_callback(stored_count, total_pages, "completed")
-
-
-    def _process_pages_parallel(self, pages: List[PDFPage], vector_store, stats: dict,
-                                 progress_callback: Optional[Callable], start_time: float):
-        """多线程并行处理页面"""
-        import threading
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        
-        total_pages = len(pages)
-        processed_count = 0
-        lock = threading.Lock()
-        last_progress_time = start_time
-        
-        def process_single_page(page: PDFPage) -> Tuple[int, bool, str]:
-            """处理单个页面，返回 (page_num, success, error_msg)"""
-            try:
-                # 生成 embedding
-                embedding = self.embedder.embed(page.content[:2000])
-                
-                # 存储到向量数据库
-                doc_id = self._generate_doc_id(page)
-                
-                # 构建元数据
-                meta = {
-                    **page.metadata,
-                    "doc_id": doc_id,
-                    "doc_type": "pdf",
-                    "file_ext": ".pdf",
-                    "content_preview": page.content[:200],
-                    "processed_at": time.time()
-                }
-                
-                vector_store.add_with_embedding(
-                    text=page.content,
-                    embedding=embedding,
-                    metadata=meta
-                )
-                
-                return (page.page_num, True, "")
-                
-            except Exception as e:
-                return (page.page_num, False, str(e))
-        
-        # 使用线程池并行处理
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            # 提交所有任务
-            future_to_page = {
-                executor.submit(process_single_page, page): page 
-                for page in pages
-            }
-            
-            # 收集结果
-            for future in as_completed(future_to_page):
-                page_num, success, error_msg = future.result()
-                
-                with lock:
-                    if success:
-                        stats["pages_stored"] += 1
-                    else:
-                        stats["errors"].append(f"页面 {page_num}: {error_msg}")
-                        logger.warning(f"页面 {page_num} 处理失败: {error_msg}")
-                    
-                    processed_count += 1
-                    
-                    # 回调通知
-                    if progress_callback:
-                        progress_callback(stats["pages_stored"], total_pages, "processing")
-                    
-                    # 定期进度报告
-                    current_time = time.time()
-                    if current_time - last_progress_time >= self.PROGRESS_INTERVAL:
-                        self._log_progress(processed_count, total_pages, "embedding", start_time)
-                        last_progress_time = current_time
+        return stats
     
-    def _process_pages_sequential(self, pages: List[PDFPage], vector_store, stats: dict,
-                                   progress_callback: Optional[Callable], start_time: float):
-        """单线程顺序处理页面"""
-        total_pages = len(pages)
-        last_progress_time = start_time
-        
-        for page in pages:
-            try:
-                # 生成 embedding
-                embedding = self.embedder.embed(page.content[:2000])
-                
-                # 存储到向量数据库
-                doc_id = self._generate_doc_id(page)
-                
-                # 构建元数据
-                meta = {
-                    **page.metadata,
-                    "doc_id": doc_id,
-                    "content_preview": page.content[:200],
-                    "processed_at": time.time()
-                }
-                
-                vector_store.add_with_embedding(
-                    text=page.content,
-                    embedding=embedding,
-                    metadata=meta
-                )
-                
-                stats["pages_stored"] += 1
-                
-                # 回调通知
-                if progress_callback:
-                    progress_callback(stats["pages_stored"], total_pages, "processing")
-                
-                # 定期进度报告
-                current_time = time.time()
-                if current_time - last_progress_time >= self.PROGRESS_INTERVAL:
-                    self._log_progress(stats["pages_stored"], total_pages, "embedding", start_time)
-                    last_progress_time = current_time
-                
-            except Exception as e:
-                error_msg = f"页面 {page.page_num} 处理失败: {e}"
-                stats["errors"].append(error_msg)
-                logger.warning(error_msg)
-    
-    def _generate_doc_id(self, page: PDFPage) -> str:
-        """生成文档唯一 ID"""
-        content_hash = hashlib.md5(
-            f"{page.metadata['source']}_{page.page_num}_{page.content[:100]}".encode()
-        ).hexdigest()[:16]
-        return f"{page.metadata['chip']}_p{page.page_num}_{content_hash}"
+    def _is_valid(self, embedding: List[float]) -> bool:
+        """验证 embedding 有效性"""
+        if not embedding:
+            return False
+        if any(x != x for x in embedding):  # NaN
+            return False
+        if any(abs(x) == float('inf') for x in embedding):  # Inf
+            return False
+        if all(x == 0 for x in embedding):  # 全零
+            return False
+        return True
 
 
-# 便捷函数
-def process_pdf_directory(directory: str, vector_store, embedder, 
-                          file_pattern: str = "*.pdf") -> List[Dict[str, Any]]:
-    """
-    批量处理目录中的所有 PDF
-    
-    Args:
-        directory: PDF 目录路径
-        vector_store: 向量存储实例
-        embedder: 嵌入生成器
-        file_pattern: 文件匹配模式
-        
-    Returns:
-        每个 PDF 的处理结果列表
-    """
-    processor = PDFProcessor(embedder)
+# ============ 便捷函数 ============
+
+def process_pdf_file(pdf_path: str, vector_store, embedder,
+                     chunk_size: int = 500, overlap: int = 80) -> Dict[str, Any]:
+    """处理单个 PDF 文件"""
+    processor = PDFProcessor(embedder=embedder, chunk_size=chunk_size, overlap=overlap)
+    return processor.process_and_store(Path(pdf_path), vector_store)
+
+
+def process_pdf_directory(directory: str, vector_store, embedder,
+                          chunk_size: int = 500, overlap: int = 80) -> List[Dict[str, Any]]:
+    """批量处理目录中的所有 PDF"""
+    processor = PDFProcessor(embedder=embedder, chunk_size=chunk_size, overlap=overlap)
     results = []
     
     pdf_dir = Path(directory)
@@ -793,37 +546,9 @@ def process_pdf_directory(directory: str, vector_store, embedder,
         logger.error(f"目录不存在: {directory}")
         return results
     
-    pdf_files = list(pdf_dir.glob(file_pattern))
-    logger.info(f"发现 {len(pdf_files)} 个 PDF 文件")
-    
-    for pdf_file in pdf_files:
+    for pdf_file in pdf_dir.glob("*.pdf"):
         result = processor.process_and_store(pdf_file, vector_store)
-        result["file"] = str(pdf_file.name)
+        result["file"] = pdf_file.name
         results.append(result)
     
     return results
-
-
-if __name__ == "__main__":
-    # 测试
-    import sys
-    
-    if len(sys.argv) < 2:
-        print("用法: python pdf_processor.py <pdf_file>")
-        sys.exit(1)
-    
-    pdf_file = sys.argv[1]
-    
-    # 初始化处理器（不带 embedder，仅测试解析）
-    processor = PDFProcessor()
-    
-    # 解析 PDF
-    pages = processor.parse_pdf(pdf_file)
-    
-    print(f"\nPDF: {pdf_file}")
-    print(f"总页数: {len(pages)}")
-    print(f"\n元数据: {pages[0].metadata if pages else 'N/A'}")
-    
-    if pages:
-        print(f"\n第一页内容预览:")
-        print(f"{pages[0].content[:500]}...")
