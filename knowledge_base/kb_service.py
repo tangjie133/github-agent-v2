@@ -62,9 +62,13 @@ class SimpleEmbedding:
             self.hosts = [host]
         self._host_index = 0
         self._host_lock = threading.Lock()
+        self._dimension_lock = threading.Lock()  # 维度检测锁
         
         self._cache = {}  # 简单缓存
         self._dimension = None  # 动态获取的维度
+        
+        # 预检测维度（避免运行时多次检测）
+        self._pre_detect_dimension()
         
         # 配置连接池（提高并发性能）
         self._session = requests.Session()
@@ -88,58 +92,123 @@ class SimpleEmbedding:
             self._host_index = (self._host_index + 1) % len(self.hosts)
             return host
         
-    def _get_dimension(self) -> int:
-        """获取向量维度（动态检测，结果缓存）"""
-        if self._dimension is not None:
-            return self._dimension
+    def _pre_detect_dimension(self):
+        """预检测向量维度（在初始化时调用一次）"""
+        # 首先尝试从已知模型获取
+        if self.model in self.MODEL_DIMENSIONS:
+            self._dimension = self.MODEL_DIMENSIONS[self.model]
+            logger.info(f"使用预配置维度: {self._dimension} (模型: {self.model})")
+            return
         
-        # 尝试动态检测（调用一次嵌入服务）
+        # 未知模型，尝试动态检测
         try:
             test_embedding = self.embed("test", use_cache=False)
             self._dimension = len(test_embedding)
-            logger.info(f"检测到模型 '{self.model}' 的向量维度: {self._dimension}")
-            return self._dimension
+            logger.info(f"动态检测到模型 '{self.model}' 的向量维度: {self._dimension}")
         except Exception as e:
-            # 如果动态检测失败，从已知模型列表查找
+            logger.warning(f"动态检测失败 ({e})，使用默认维度 768")
+            self._dimension = 768
+    
+    def _get_dimension(self) -> int:
+        """获取向量维度（线程安全）"""
+        with self._dimension_lock:
+            if self._dimension is not None:
+                return self._dimension
+            
+            # 双重检查（防止并发初始化）
+            # 尝试从已知模型获取
             if self.model in self.MODEL_DIMENSIONS:
                 self._dimension = self.MODEL_DIMENSIONS[self.model]
-                logger.warning(f"动态检测失败 ({e})，使用预配置维度: {self._dimension}")
                 return self._dimension
+            
             # 最后默认使用768
-            logger.warning(f"无法检测模型 '{self.model}' 的维度，使用默认值 768")
             self._dimension = 768
-            return 768
+            return self._dimension
         
+    def _is_valid_embedding(self, embedding: List[float]) -> bool:
+        """检查 embedding 是否有效（无 NaN/Inf，非全零）"""
+        if not embedding or len(embedding) == 0:
+            return False
+        
+        # 检查 NaN (NaN != NaN)
+        if any(x != x for x in embedding):
+            return False
+        
+        # 检查 Inf
+        if any(abs(x) == float('inf') for x in embedding):
+            return False
+        
+        # 检查全零
+        if all(x == 0.0 for x in embedding):
+            return False
+        
+        # 检查维度是否合理
+        if len(embedding) < 100:
+            return False
+        
+        return True
+    
     def embed(self, text: str, use_cache: bool = True) -> List[float]:
-        """生成文本嵌入向量（使用连接池优化 + 负载均衡）"""
+        """生成文本嵌入向量（使用连接池优化 + 负载均衡 + NaN 保护）"""
         # 检查缓存
         if use_cache and text in self._cache:
-            return self._cache[text]
+            cached = self._cache[text]
+            if self._is_valid_embedding(cached):
+                return cached
+            else:
+                # 缓存值无效，删除并重新生成
+                del self._cache[text]
         
         host = self._get_host()
+        dim = self._get_dimension()
         
-        try:
-            response = self._session.post(
-                f"{host}/api/embeddings",
-                json={"model": self.model, "prompt": text},
-                timeout=30
-            )
-            response.raise_for_status()
-            embedding = response.json()["embedding"]
-            
-            # 检查 NaN 或无效值
-            if any(x != x for x in embedding) or all(x == 0.0 for x in embedding):  # NaN check
-                logger.warning(f"Embedding 包含 NaN 或全零: {host}")
-                return [0.0] * self._get_dimension()
-            
-            # 缓存结果
-            if use_cache:
-                self._cache[text] = embedding
-            return embedding
-        except Exception as e:
-            logger.error(f"嵌入生成失败 ({host}): {e}")
-            # 返回零向量作为降级（使用正确的维度）
-            return [0.0] * self._get_dimension()
+        # 重试机制
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = self._session.post(
+                    f"{host}/api/embeddings",
+                    json={"model": self.model, "prompt": text},
+                    timeout=30
+                )
+                response.raise_for_status()
+                result = response.json()
+                
+                # 检查响应格式
+                if "embedding" not in result:
+                    logger.warning(f"响应缺少 embedding 字段 (attempt {attempt+1}): {host}")
+                    if attempt < max_retries - 1:
+                        import time
+                        time.sleep(0.5 * (attempt + 1))  # 指数退避
+                        continue
+                    return [0.0] * dim
+                
+                embedding = result["embedding"]
+                
+                # 验证 embedding 有效性
+                if not self._is_valid_embedding(embedding):
+                    logger.warning(f"Embedding 无效 (NaN/Inf/全零/维度错误) (attempt {attempt+1}): {host}, dim={len(embedding) if embedding else 0}")
+                    if attempt < max_retries - 1:
+                        import time
+                        time.sleep(0.5 * (attempt + 1))
+                        continue
+                    return [0.0] * dim
+                
+                # 缓存并返回有效结果
+                if use_cache:
+                    self._cache[text] = embedding
+                return embedding
+                
+            except Exception as e:
+                logger.error(f"嵌入生成失败 ({host}, attempt {attempt+1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    import time
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+        
+        # 所有重试失败，返回零向量
+        logger.error(f"嵌入生成全部失败，返回零向量: {text[:50]}...")
+        return [0.0] * dim
     
     def embed_batch(self, texts: List[str], max_workers: int = 4) -> List[List[float]]:
         """
@@ -376,6 +445,14 @@ class ChromaVectorStore:
         except Exception as e:
             logger.error(f"获取文档哈希失败: {e}")
             return {}
+    
+    def count(self) -> int:
+        """获取集合中的文档数量"""
+        try:
+            return self.collection.count()
+        except Exception as e:
+            logger.error(f"获取文档数量失败: {e}")
+            return 0
     
     def clear(self):
         """清空集合"""
@@ -798,6 +875,47 @@ class KBRequestHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": "Invalid JSON"}, 400)
             except Exception as e:
                 logger.exception("Query failed")
+                self._send_json({"error": str(e)}, 500)
+        
+        elif self.path == "/add":
+            """添加文档到知识库"""
+            try:
+                content_length = int(self.headers.get('Content-Length', 0))
+                post_data = self.rfile.read(content_length)
+                data = json.loads(post_data.decode())
+                
+                text = data.get("text", "")
+                metadata = data.get("metadata", {})
+                
+                if not text:
+                    self._send_json({"error": "Missing text"}, 400)
+                    return
+                
+                # 生成 embedding
+                embedding = self.kb_service.embedder.embed(text[:2000])
+                
+                # 验证 embedding 有效性
+                if not self.kb_service.embedder._is_valid_embedding(embedding):
+                    logger.error(f"生成的 embedding 无效，跳过存储")
+                    self._send_json({"error": "Invalid embedding generated"}, 500)
+                    return
+                
+                # 存储到 ChromaDB
+                self.kb_service.vector_store.add_with_embedding(
+                    text=text,
+                    embedding=embedding,
+                    metadata=metadata
+                )
+                
+                self._send_json({
+                    "status": "success",
+                    "documents": self.kb_service.vector_store.count()
+                })
+                
+            except json.JSONDecodeError:
+                self._send_json({"error": "Invalid JSON"}, 400)
+            except Exception as e:
+                logger.exception("Add document failed")
                 self._send_json({"error": str(e)}, 500)
         
         else:

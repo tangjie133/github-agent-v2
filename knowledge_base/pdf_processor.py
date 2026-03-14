@@ -299,13 +299,125 @@ class PDFProcessor:
         return pages
     
     def _clean_text(self, text: str) -> str:
-        """清理提取的文本"""
-        # 移除多余空白
-        text = re.sub(r'\s+', ' ', text)
-        # 移除页眉页脚常见模式
-        text = re.sub(r'^\d+\s*/\s*\d+\s*', '', text)  # 如 "1 / 100"
-        # 移除特殊字符
+        """
+        清理提取的文本 - 增强版（针对 BMI160 等 datasheet 优化）
+        
+        移除内容：
+        1. 页眉（文档编号、版本、日期、厂商）
+        2. 页脚（页码）
+        3. 版权声明
+        4. 商标声明
+        5. 注意事项
+        """
+        if not text:
+            return ""
+        
+        # 保存原始长度用于检查
+        original_len = len(text)
+        
+        # ===== 1. 首先进行全文模式替换（处理页眉和内容在同一行的情况）=====
+        # 这是关键：BMI160 的页眉很长，可能和正文连在一起
+        
+        # 模式：BMI160 Data sheet Page X BST-XXX... 一直到 notice.
+        header_full_pattern = (
+            r'BMI160 Data sheet Page \d+ BST-[^|]+\| Revision \d+\.\d+ \| [^©]+© '  # 开头
+            r'Bosch Sensortec[^.]*\. '  # 厂商
+            r'© Bosch Sensortec GmbH reserves all rights[^.]*\. '  # 版权1
+            r'We reserve all rights of disposal[^.]*\. '  # 版权2
+            r'BOSCH and the symbol are registered trademarks[^.]*\. '  # 商标
+            r'Note: Specifications within this document are preliminary[^.]*\.'  # 注意
+        )
+        
+        # 尝试匹配完整的页眉块
+        text = re.sub(header_full_pattern, ' ', text, flags=re.IGNORECASE | re.DOTALL)
+        
+        # 再次尝试更宽松的模式（针对可能的变体）
+        # 从 "BMI160 Data sheet" 到 "notice." 之间的所有内容
+        loose_header_pattern = (
+            r'BMI160 Data sheet Page \d+[^.]*?'  # 开头到页码
+            r'© Bosch Sensortec GmbH.*?notice\.'  # 版权到 notice
+        )
+        text = re.sub(loose_header_pattern, ' ', text, flags=re.IGNORECASE | re.DOTALL)
+        
+        # ===== 2. 逐行清理（处理单独的页眉行）=====
+        lines = text.split('\n')
+        cleaned_lines = []
+        
+        header_patterns = [
+            # BST-BMI160-DS000-07 | Revision 0.8 | February 2015 Bosch Sensortec
+            r'BST-\w+-DS\d+-\d+.*?\|.*?Revision.*?\d+\.\d+',
+            # Page X BST-XXX 模式
+            r'Page\s+\d+\s+BST-[^\n]*',
+            # 文档标题行
+            r'^BMI160 Data sheet.*$',
+            r'^\d+\s*\|\s*BST-[^\n]*$',
+            # 厂商名称行
+            r'^Bosch Sensortec.*$',
+            # 版权相关行
+            r'©\s*Bosch Sensortec',
+            r'reserves all rights',
+            r'rights of disposal',
+            r'registered trademarks',
+            r'Specifications within this document',
+        ]
+        
+        footer_patterns = [
+            r'Page\s+\d+\s+of\s+\d+',
+            r'^\s*\d+\s*$',  # 单独页码
+        ]
+        
+        for line in lines:
+            line_stripped = line.strip()
+            if not line_stripped:
+                continue
+                
+            # 检查是否为页眉行
+            is_header = False
+            for pattern in header_patterns:
+                if re.search(pattern, line_stripped, re.IGNORECASE):
+                    is_header = True
+                    break
+            
+            # 检查是否为页脚行
+            is_footer = False
+            for pattern in footer_patterns:
+                if re.search(pattern, line_stripped, re.IGNORECASE):
+                    is_footer = True
+                    break
+            
+            if not is_header and not is_footer:
+                cleaned_lines.append(line)
+        
+        text = '\n'.join(cleaned_lines)
+        
+        # ===== 3. 再次进行全文清理（捕获遗漏的）=====
+        copyright_patterns = [
+            # © Bosch Sensortec GmbH reserves all rights...
+            r'©\s*Bosch Sensortec GmbH.*?rights? reserved[^.]*\.',
+            r'Bosch Sensortec GmbH reserves all rights[^.]*\.',
+            r'We reserve all rights of disposal[^.]*\.',
+            # BOSCH and the symbol are registered trademarks...
+            r'BOSCH and the symbol are registered trademarks[^.]*\.',
+            r'Note: Specifications within this document are preliminary[^.]*\.',
+        ]
+        
+        for pattern in copyright_patterns:
+            text = re.sub(pattern, ' ', text, flags=re.IGNORECASE | re.DOTALL)
+        
+        # ===== 4. 移除修订版本行 =====
+        text = re.sub(r'Revision\s+\d+\.\d+[^\n]*', ' ', text, flags=re.IGNORECASE)
+        
+        # ===== 5. 清理多余空白 =====
+        text = re.sub(r'[ \t]+', ' ', text)  # 多个空格/制表符 -> 单个空格
+        text = re.sub(r'\n{3,}', '\n\n', text)  # 最多保留2个换行
         text = text.strip()
+        
+        # ===== 6. 如果清理后太短，可能是清理过度，返回原始文本的基本清理 =====
+        if len(text) < original_len * 0.05:  # 降低到 5%
+            # 基本清理：只移除多余空格
+            text = re.sub(r'[ \t]+', ' ', text)
+            text = text.strip()
+        
         return text
     
     def process_and_store(self, pdf_path: str | Path, vector_store, 
